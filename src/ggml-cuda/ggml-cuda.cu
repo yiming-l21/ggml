@@ -37,6 +37,7 @@
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
 #include "ggml-cuda/quantize.cuh"
+#include "ggml-cuda/qwen-fused-qkv-pack.cuh"
 #include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
@@ -2939,6 +2940,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_CONCAT:
             ggml_cuda_op_concat(ctx, dst);
             break;
+        case GGML_OP_CUSTOM:
+            if (ggml_cuda_is_qwen_fused_qkv_pack(dst)) {
+                ggml_cuda_op_qwen_fused_qkv_pack(ctx, dst);
+                break;
+            }
+            return false;
         case GGML_OP_UPSCALE:
             ggml_cuda_op_upscale(ctx, dst);
             break;
@@ -5282,6 +5289,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 ggml_type src0_type = op->src[0]->type;
                 return src0_type != GGML_TYPE_I32 && src0_type != GGML_TYPE_I16;
             } break;
+        case GGML_OP_CUSTOM:
+            return ggml_cuda_is_qwen_fused_qkv_pack(op);
         case GGML_OP_CONV_TRANSPOSE_1D:
             {
                 ggml_type src0_type = op->src[0]->type;

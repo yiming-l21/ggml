@@ -19,7 +19,8 @@ struct qwen_fused_qkv_pack_cuda_params {
 };
 
 bool ggml_cuda_is_qwen_fused_qkv_pack(const ggml_tensor* dst) {
-    if (dst == nullptr || dst->op != GGML_OP_CUSTOM || dst->type != GGML_TYPE_F32) {
+    if (dst == nullptr || dst->op != GGML_OP_CUSTOM ||
+        (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16)) {
         return false;
     }
     ggml_custom_op_params params;
@@ -327,6 +328,57 @@ static __global__ void qwen_fused_qkv_send_pack_f32_kernel(const char* __restric
     }
 }
 
+static __global__ void qwen_fused_qkv_send_pack_mixed_kernel(const char* __restrict__ q,
+                                                             const char* __restrict__ k,
+                                                             const char* __restrict__ v,
+                                                             uint32_t* __restrict__ dst,
+                                                             int64_t world_size,
+                                                             int64_t head_dim,
+                                                             int64_t heads,
+                                                             int64_t shard_sequence,
+                                                             size_t q_nb0,
+                                                             size_t q_nb1,
+                                                             size_t q_nb2,
+                                                             size_t q_nb3,
+                                                             size_t k_nb0,
+                                                             size_t k_nb1,
+                                                             size_t k_nb2,
+                                                             size_t k_nb3,
+                                                             size_t v_nb0,
+                                                             size_t v_nb1,
+                                                             size_t v_nb2,
+                                                             size_t v_nb3) {
+    const int64_t shard_heads = heads / world_size;
+    const int64_t packed_dim = head_dim * 2;
+    const int64_t total = packed_dim * shard_heads * shard_sequence * world_size;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem = linear;
+        const int64_t d_all = rem % packed_dim;
+        rem /= packed_dim;
+        const int64_t head_local = rem % shard_heads;
+        rem /= shard_heads;
+        const int64_t seq = rem % shard_sequence;
+        rem /= shard_sequence;
+        const int64_t peer = rem;
+        const int64_t head = head_local + peer * shard_heads;
+
+        if (d_all < head_dim) {
+            const float value = *reinterpret_cast<const float*>(q + d_all * q_nb0 + head * q_nb1 + seq * q_nb2 + 0 * q_nb3);
+            dst[linear] = __float_as_uint(value);
+        } else {
+            const int64_t d = d_all - head_dim;
+            const float k_value = *reinterpret_cast<const float*>(k + d * k_nb0 + head * k_nb1 + seq * k_nb2 + 0 * k_nb3);
+            const float v_value = *reinterpret_cast<const float*>(v + d * v_nb0 + head * v_nb1 + seq * v_nb2 + 0 * v_nb3);
+            const uint32_t k_half = static_cast<uint32_t>(__half_as_ushort(__float2half(k_value)));
+            const uint32_t v_half = static_cast<uint32_t>(__half_as_ushort(__float2half(v_value)));
+            dst[linear] = k_half | (v_half << 16);
+        }
+    }
+}
+
 static __global__ void qwen_fused_attn_head_to_seq_send_pack_f32_kernel(const char* __restrict__ attn,
                                                                         float* __restrict__ dst,
                                                                         int64_t txt_real_seq,
@@ -418,6 +470,491 @@ static __global__ void qwen_fused_attn_head_to_seq_recv_unpack_f32_kernel(const 
     }
 }
 
+static __global__ void qwen_fused_attn_head_to_seq_send_pack_f16_kernel(const char* __restrict__ attn,
+                                                                        half* __restrict__ dst,
+                                                                        int64_t txt_real_seq,
+                                                                        int64_t img_real_seq,
+                                                                        int64_t txt_padded_seq,
+                                                                        int64_t img_padded_seq,
+                                                                        int64_t world_size,
+                                                                        int64_t head_dim,
+                                                                        int64_t shard_heads,
+                                                                        size_t attn_nb0,
+                                                                        size_t attn_nb1,
+                                                                        size_t attn_nb2,
+                                                                        size_t attn_nb3) {
+    const int64_t txt_shard_seq = txt_padded_seq / world_size;
+    const int64_t img_shard_seq = img_padded_seq / world_size;
+    const int64_t txt_chunk = head_dim * shard_heads * txt_shard_seq;
+    const int64_t img_chunk = head_dim * shard_heads * img_shard_seq;
+    const int64_t count_per_peer = txt_chunk + img_chunk;
+    const int64_t total = count_per_peer * world_size;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem = linear;
+        const int64_t peer = rem / count_per_peer;
+        rem -= peer * count_per_peer;
+        const bool is_img = rem >= txt_chunk;
+        if (is_img) {
+            rem -= txt_chunk;
+        }
+        const int64_t shard_seq = is_img ? img_shard_seq : txt_shard_seq;
+        const int64_t stream_real_seq = is_img ? img_real_seq : txt_real_seq;
+        const int64_t d = rem % head_dim;
+        rem /= head_dim;
+        const int64_t head = rem % shard_heads;
+        rem /= shard_heads;
+        const int64_t local_tok = rem;
+        const int64_t stream_tok = peer * shard_seq + local_tok;
+
+        float value = 0.0f;
+        if (stream_tok < stream_real_seq) {
+            const int64_t total_tok = is_img ? txt_real_seq + stream_tok : stream_tok;
+            value = *reinterpret_cast<const float*>(attn +
+                                                    d * attn_nb0 +
+                                                    head * attn_nb1 +
+                                                    total_tok * attn_nb2 +
+                                                    0 * attn_nb3);
+        }
+        dst[linear] = __float2half(value);
+    }
+}
+
+static __global__ void qwen_fused_attn_head_to_seq_recv_unpack_f16_kernel(const half* __restrict__ recv_flat,
+                                                                          float* __restrict__ dst,
+                                                                          int64_t stream_index,
+                                                                          int64_t txt_padded_seq,
+                                                                          int64_t img_padded_seq,
+                                                                          int64_t world_size,
+                                                                          int64_t head_dim,
+                                                                          int64_t heads) {
+    const int64_t shard_heads = heads / world_size;
+    const int64_t txt_shard_seq = txt_padded_seq / world_size;
+    const int64_t img_shard_seq = img_padded_seq / world_size;
+    const int64_t out_shard_seq = stream_index == 0 ? txt_shard_seq : img_shard_seq;
+    const int64_t txt_chunk = head_dim * shard_heads * txt_shard_seq;
+    const int64_t img_chunk = head_dim * shard_heads * img_shard_seq;
+    const int64_t count_per_peer = txt_chunk + img_chunk;
+    const int64_t stream_offset = stream_index == 0 ? 0 : txt_chunk;
+    const int64_t total = head_dim * heads * out_shard_seq;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem = linear;
+        const int64_t d = rem % head_dim;
+        rem /= head_dim;
+        const int64_t head = rem % heads;
+        rem /= heads;
+        const int64_t local_tok = rem;
+        const int64_t src_peer = head / shard_heads;
+        const int64_t local_head = head - src_peer * shard_heads;
+        const int64_t src_idx =
+            src_peer * count_per_peer +
+            stream_offset +
+            d +
+            local_head * head_dim +
+            local_tok * head_dim * shard_heads;
+        dst[linear] = __half2float(recv_flat[src_idx]);
+    }
+}
+
+static __global__ void qwen_fused_two_stream_flat_send_pack_f32_kernel(const char* __restrict__ first,
+                                                                       const char* __restrict__ second,
+                                                                       float* __restrict__ dst,
+                                                                       int64_t first_chunk,
+                                                                       int64_t second_chunk,
+                                                                       int64_t world_size) {
+    const int64_t count_per_peer = first_chunk + second_chunk;
+    const int64_t total          = count_per_peer * world_size;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int64_t peer = linear / count_per_peer;
+        const int64_t rem  = linear - peer * count_per_peer;
+        if (rem < first_chunk) {
+            dst[linear] = *reinterpret_cast<const float*>(first + (peer * first_chunk + rem) * sizeof(float));
+        } else {
+            const int64_t second_rem = rem - first_chunk;
+            dst[linear] = *reinterpret_cast<const float*>(second + (peer * second_chunk + second_rem) * sizeof(float));
+        }
+    }
+}
+
+static __global__ void qwen_fused_two_stream_flat_recv_unpack_f32_kernel(const char* __restrict__ recv_flat,
+                                                                         float* __restrict__ dst,
+                                                                         int64_t stream_index,
+                                                                         int64_t first_chunk,
+                                                                         int64_t second_chunk,
+                                                                         int64_t world_size) {
+    const int64_t stream_chunk   = stream_index == 0 ? first_chunk : second_chunk;
+    const int64_t stream_offset  = stream_index == 0 ? 0 : first_chunk;
+    const int64_t count_per_peer = first_chunk + second_chunk;
+    const int64_t total          = stream_chunk * world_size;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int64_t peer = linear / stream_chunk;
+        const int64_t rem  = linear - peer * stream_chunk;
+        const int64_t src  = peer * count_per_peer + stream_offset + rem;
+        dst[linear] = *reinterpret_cast<const float*>(recv_flat + src * sizeof(float));
+    }
+}
+
+static __device__ __forceinline__ int64_t mmdit_joint_qkv_src_index(int64_t d,
+                                                                    int64_t local_head,
+                                                                    int64_t local_seq,
+                                                                    int64_t peer,
+                                                                    int64_t plane,
+                                                                    int64_t head_dim,
+                                                                    int64_t shard_heads,
+                                                                    int64_t stream_offset,
+                                                                    int64_t count_per_peer) {
+    const int64_t total_head_dim = head_dim * 3;
+    return peer * count_per_peer +
+           stream_offset +
+           plane * head_dim +
+           d +
+           local_head * total_head_dim +
+           local_seq * total_head_dim * shard_heads;
+}
+
+static __global__ void mmdit_fused_joint_qkv_to_seq_major_f32_kernel(const char* __restrict__ recv_flat,
+                                                                     float* __restrict__ dst,
+                                                                     int64_t plane,
+                                                                     int64_t context_real_seq,
+                                                                     int64_t x_real_seq,
+                                                                     int64_t context_full_seq,
+                                                                     int64_t x_full_seq,
+                                                                     int64_t world_size,
+                                                                     int64_t head_dim,
+                                                                     int64_t shard_heads) {
+    const int64_t total_real_seq    = context_real_seq + x_real_seq;
+    const int64_t context_shard_seq = context_full_seq / world_size;
+    const int64_t x_shard_seq       = x_full_seq / world_size;
+    const int64_t total_head_dim    = head_dim * 3;
+    const int64_t context_chunk     = total_head_dim * shard_heads * context_shard_seq;
+    const int64_t x_chunk           = total_head_dim * shard_heads * x_shard_seq;
+    const int64_t count_per_peer    = context_chunk + x_chunk;
+    const int64_t total             = head_dim * total_real_seq * shard_heads;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem           = linear;
+        const int64_t d       = rem % head_dim;
+        rem /= head_dim;
+        const int64_t out_tok = rem % total_real_seq;
+        rem /= total_real_seq;
+        const int64_t out_head = rem;
+
+        const bool is_x = out_tok >= context_real_seq;
+        const int64_t stream_tok = is_x ? out_tok - context_real_seq : out_tok;
+        const int64_t stream_shard_seq = is_x ? x_shard_seq : context_shard_seq;
+        const int64_t stream_offset = is_x ? context_chunk : 0;
+
+        const int64_t peer = stream_tok / stream_shard_seq;
+        const int64_t local_seq = stream_tok - peer * stream_shard_seq;
+        const int64_t local_head = out_head;
+        if (local_seq >= stream_shard_seq || peer >= world_size) {
+            dst[linear] = 0.0f;
+            continue;
+        }
+
+        const int64_t src_idx = mmdit_joint_qkv_src_index(d,
+                                                          local_head,
+                                                          local_seq,
+                                                          peer,
+                                                          plane,
+                                                          head_dim,
+                                                          shard_heads,
+                                                          stream_offset,
+                                                          count_per_peer);
+        dst[linear] = *reinterpret_cast<const float*>(recv_flat + src_idx * sizeof(float));
+    }
+}
+
+static __global__ void mmdit_fused_joint_qkv_v_to_seq_major_f32_kernel(const char* __restrict__ recv_flat,
+                                                                       float* __restrict__ dst,
+                                                                       int64_t context_real_seq,
+                                                                       int64_t x_real_seq,
+                                                                       int64_t context_full_seq,
+                                                                       int64_t x_full_seq,
+                                                                       int64_t world_size,
+                                                                       int64_t head_dim,
+                                                                       int64_t shard_heads) {
+    const int64_t total_real_seq    = context_real_seq + x_real_seq;
+    const int64_t context_shard_seq = context_full_seq / world_size;
+    const int64_t x_shard_seq       = x_full_seq / world_size;
+    const int64_t total_head_dim    = head_dim * 3;
+    const int64_t context_chunk     = total_head_dim * shard_heads * context_shard_seq;
+    const int64_t x_chunk           = total_head_dim * shard_heads * x_shard_seq;
+    const int64_t count_per_peer    = context_chunk + x_chunk;
+    const int64_t total             = head_dim * shard_heads * total_real_seq;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem            = linear;
+        const int64_t d        = rem % head_dim;
+        rem /= head_dim;
+        const int64_t out_tok  = rem % total_real_seq;
+        rem /= total_real_seq;
+        const int64_t out_head = rem;
+
+        const bool is_x = out_tok >= context_real_seq;
+        const int64_t stream_tok = is_x ? out_tok - context_real_seq : out_tok;
+        const int64_t stream_shard_seq = is_x ? x_shard_seq : context_shard_seq;
+        const int64_t stream_offset = is_x ? context_chunk : 0;
+
+        const int64_t local_head = out_head;
+        const int64_t local_seq = stream_tok % stream_shard_seq;
+        const int64_t peer = stream_tok / stream_shard_seq;
+        if (peer >= world_size) {
+            dst[linear] = 0.0f;
+            continue;
+        }
+
+        const int64_t src_idx = mmdit_joint_qkv_src_index(d,
+                                                          local_head,
+                                                          local_seq,
+                                                          peer,
+                                                          2,
+                                                          head_dim,
+                                                          shard_heads,
+                                                          stream_offset,
+                                                          count_per_peer);
+        dst[linear] = *reinterpret_cast<const float*>(recv_flat + src_idx * sizeof(float));
+    }
+}
+
+static __global__ void mmdit_fused_joint_mixed_q_to_seq_major_kernel(const uint32_t* __restrict__ recv_flat,
+                                                                     float* __restrict__ dst,
+                                                                     int64_t context_real_seq,
+                                                                     int64_t x_real_seq,
+                                                                     int64_t context_full_seq,
+                                                                     int64_t x_full_seq,
+                                                                     int64_t world_size,
+                                                                     int64_t head_dim,
+                                                                     int64_t shard_heads) {
+    const int64_t total_real_seq = context_real_seq + x_real_seq;
+    const int64_t context_shard_seq = context_full_seq / world_size;
+    const int64_t x_shard_seq = x_full_seq / world_size;
+    const int64_t packed_dim = head_dim * 2;
+    const int64_t context_chunk = packed_dim * shard_heads * context_shard_seq;
+    const int64_t x_chunk = packed_dim * shard_heads * x_shard_seq;
+    const int64_t count_per_peer = context_chunk + x_chunk;
+    const int64_t total = head_dim * total_real_seq * shard_heads;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem = linear;
+        const int64_t d = rem % head_dim;
+        rem /= head_dim;
+        const int64_t out_tok = rem % total_real_seq;
+        rem /= total_real_seq;
+        const int64_t out_head = rem;
+
+        const bool is_x = out_tok >= context_real_seq;
+        const int64_t stream_tok = is_x ? out_tok - context_real_seq : out_tok;
+        const int64_t stream_full_seq = is_x ? x_full_seq : context_full_seq;
+        const int64_t stream_offset = is_x ? context_chunk : 0;
+
+        const int64_t row = stream_tok + out_head * stream_full_seq;
+        const int64_t peer = row % world_size;
+        int64_t row_rem = row / world_size;
+        const int64_t local_head = row_rem % shard_heads;
+        const int64_t local_seq = row_rem / shard_heads;
+
+        const int64_t src_idx =
+            peer * count_per_peer +
+            stream_offset +
+            d +
+            local_head * packed_dim +
+            local_seq * packed_dim * shard_heads;
+        dst[linear] = __uint_as_float(recv_flat[src_idx]);
+    }
+}
+
+static __global__ void mmdit_fused_joint_mixed_kv_to_seq_major_kernel(const uint32_t* __restrict__ recv_flat,
+                                                                      half* __restrict__ dst,
+                                                                      bool unpack_v,
+                                                                      int64_t context_real_seq,
+                                                                      int64_t x_real_seq,
+                                                                      int64_t context_full_seq,
+                                                                      int64_t x_full_seq,
+                                                                      int64_t world_size,
+                                                                      int64_t head_dim,
+                                                                      int64_t shard_heads) {
+    const int64_t total_real_seq = context_real_seq + x_real_seq;
+    const int64_t context_shard_seq = context_full_seq / world_size;
+    const int64_t x_shard_seq = x_full_seq / world_size;
+    const int64_t packed_dim = head_dim * 2;
+    const int64_t context_chunk = packed_dim * shard_heads * context_shard_seq;
+    const int64_t x_chunk = packed_dim * shard_heads * x_shard_seq;
+    const int64_t count_per_peer = context_chunk + x_chunk;
+    const int64_t total = head_dim * total_real_seq * shard_heads;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem = linear;
+        const int64_t d = rem % head_dim;
+        rem /= head_dim;
+        const int64_t out_tok = rem % total_real_seq;
+        rem /= total_real_seq;
+        const int64_t out_head = rem;
+
+        const bool is_x = out_tok >= context_real_seq;
+        const int64_t stream_tok = is_x ? out_tok - context_real_seq : out_tok;
+        const int64_t stream_shard_seq = is_x ? x_shard_seq : context_shard_seq;
+        const int64_t stream_offset = is_x ? context_chunk : 0;
+
+        int64_t local_head;
+        int64_t local_seq;
+        int64_t peer;
+        if (unpack_v) {
+            const int64_t row = out_head + stream_tok * shard_heads;
+            local_head = row % shard_heads;
+            int64_t row_rem = row / shard_heads;
+            local_seq = row_rem % stream_shard_seq;
+            peer = row_rem / stream_shard_seq;
+        } else {
+            peer = stream_tok / stream_shard_seq;
+            local_seq = stream_tok - peer * stream_shard_seq;
+            local_head = out_head;
+        }
+
+        const int64_t src_idx =
+            peer * count_per_peer +
+            stream_offset +
+            head_dim + d +
+            local_head * packed_dim +
+            local_seq * packed_dim * shard_heads;
+        const uint32_t packed = recv_flat[src_idx];
+        dst[linear] = __ushort_as_half(static_cast<unsigned short>(unpack_v ? (packed >> 16) : (packed & 0xffffu)));
+    }
+}
+
+static __device__ __forceinline__ int64_t mmdit_joint_mixed_linear_src_index(int64_t d,
+                                                                             int64_t local_head,
+                                                                             int64_t local_seq,
+                                                                             int64_t peer,
+                                                                             int64_t head_dim,
+                                                                             int64_t shard_heads,
+                                                                             int64_t stream_offset,
+                                                                             int64_t count_per_peer) {
+    const int64_t packed_dim = head_dim * 2;
+    return peer * count_per_peer +
+           stream_offset +
+           d +
+           local_head * packed_dim +
+           local_seq * packed_dim * shard_heads;
+}
+
+static __global__ void mmdit_fused_joint_mixed_linear_q_to_seq_major_kernel(const uint32_t* __restrict__ recv_flat,
+                                                                           float* __restrict__ dst,
+                                                                           int64_t context_real_seq,
+                                                                           int64_t x_real_seq,
+                                                                           int64_t context_full_seq,
+                                                                           int64_t x_full_seq,
+                                                                           int64_t world_size,
+                                                                           int64_t head_dim,
+                                                                           int64_t shard_heads) {
+    const int64_t total_real_seq    = context_real_seq + x_real_seq;
+    const int64_t context_shard_seq = context_full_seq / world_size;
+    const int64_t x_shard_seq       = x_full_seq / world_size;
+    const int64_t packed_dim        = head_dim * 2;
+    const int64_t context_chunk     = packed_dim * shard_heads * context_shard_seq;
+    const int64_t x_chunk           = packed_dim * shard_heads * x_shard_seq;
+    const int64_t count_per_peer    = context_chunk + x_chunk;
+    const int64_t total             = head_dim * total_real_seq * shard_heads;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem            = linear;
+        const int64_t d        = rem % head_dim;
+        rem /= head_dim;
+        const int64_t out_tok  = rem % total_real_seq;
+        rem /= total_real_seq;
+        const int64_t out_head = rem;
+
+        const bool is_x = out_tok >= context_real_seq;
+        const int64_t stream_tok       = is_x ? out_tok - context_real_seq : out_tok;
+        const int64_t stream_shard_seq = is_x ? x_shard_seq : context_shard_seq;
+        const int64_t stream_offset    = is_x ? context_chunk : 0;
+        const int64_t peer             = stream_tok / stream_shard_seq;
+        const int64_t local_seq        = stream_tok - peer * stream_shard_seq;
+        const int64_t local_head       = out_head;
+
+        const int64_t src_idx = mmdit_joint_mixed_linear_src_index(d,
+                                                                   local_head,
+                                                                   local_seq,
+                                                                   peer,
+                                                                   head_dim,
+                                                                   shard_heads,
+                                                                   stream_offset,
+                                                                   count_per_peer);
+        dst[linear] = __uint_as_float(recv_flat[src_idx]);
+    }
+}
+
+static __global__ void mmdit_fused_joint_mixed_linear_kv_to_seq_major_kernel(const uint32_t* __restrict__ recv_flat,
+                                                                             half* __restrict__ dst,
+                                                                             bool unpack_v,
+                                                                             int64_t context_real_seq,
+                                                                             int64_t x_real_seq,
+                                                                             int64_t context_full_seq,
+                                                                             int64_t x_full_seq,
+                                                                             int64_t world_size,
+                                                                             int64_t head_dim,
+                                                                             int64_t shard_heads) {
+    const int64_t total_real_seq    = context_real_seq + x_real_seq;
+    const int64_t context_shard_seq = context_full_seq / world_size;
+    const int64_t x_shard_seq       = x_full_seq / world_size;
+    const int64_t packed_dim        = head_dim * 2;
+    const int64_t context_chunk     = packed_dim * shard_heads * context_shard_seq;
+    const int64_t x_chunk           = packed_dim * shard_heads * x_shard_seq;
+    const int64_t count_per_peer    = context_chunk + x_chunk;
+    const int64_t total             = head_dim * total_real_seq * shard_heads;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem            = linear;
+        const int64_t d        = rem % head_dim;
+        rem /= head_dim;
+        const int64_t out_tok  = rem % total_real_seq;
+        rem /= total_real_seq;
+        const int64_t out_head = rem;
+
+        const bool is_x = out_tok >= context_real_seq;
+        const int64_t stream_tok       = is_x ? out_tok - context_real_seq : out_tok;
+        const int64_t stream_shard_seq = is_x ? x_shard_seq : context_shard_seq;
+        const int64_t stream_offset    = is_x ? context_chunk : 0;
+        const int64_t peer             = stream_tok / stream_shard_seq;
+        const int64_t local_seq        = stream_tok - peer * stream_shard_seq;
+        const int64_t local_head       = out_head;
+
+        const int64_t src_idx = mmdit_joint_mixed_linear_src_index(head_dim + d,
+                                                                   local_head,
+                                                                   local_seq,
+                                                                   peer,
+                                                                   head_dim,
+                                                                   shard_heads,
+                                                                   stream_offset,
+                                                                   count_per_peer);
+        const uint32_t packed = recv_flat[src_idx];
+        dst[linear] = __ushort_as_half(static_cast<unsigned short>(unpack_v ? (packed >> 16) : (packed & 0xffffu)));
+    }
+}
+
 static __global__ void qwen_fused_qk_pack_from_recv_f32_kernel(const char* __restrict__ txt_recv,
                                                                const char* __restrict__ img_recv,
                                                                float* __restrict__ dst,
@@ -486,6 +1023,303 @@ void ggml_cuda_op_qwen_fused_qkv_pack(ggml_backend_cuda_context& ctx, ggml_tenso
     GGML_ASSERT(qwen_params != nullptr);
     GGML_ASSERT(qwen_params->magic == QWEN_FUSED_QKV_PACK_MAGIC);
 
+    if (qwen_params->mode == 9) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        const ggml_tensor* first  = dst->src[0];
+        const ggml_tensor* second = dst->src[1];
+        GGML_ASSERT(first && second);
+        GGML_ASSERT(first->type == GGML_TYPE_F32 && second->type == GGML_TYPE_F32);
+        GGML_ASSERT(qwen_params->txt_real_seq > 0);
+        GGML_ASSERT(qwen_params->img_real_seq > 0);
+        GGML_ASSERT(qwen_params->world_size > 0);
+        GGML_ASSERT(first->ne[0] == qwen_params->txt_real_seq * qwen_params->world_size);
+        GGML_ASSERT(second->ne[0] == qwen_params->img_real_seq * qwen_params->world_size);
+        GGML_ASSERT(ggml_nelements(dst) == (qwen_params->txt_real_seq + qwen_params->img_real_seq) *
+                                           qwen_params->world_size);
+
+        const int64_t total = ggml_nelements(dst);
+        const int threads = 256;
+        const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
+        cudaStream_t stream = ctx.stream();
+        qwen_fused_two_stream_flat_send_pack_f32_kernel<<<blocks, threads, 0, stream>>>(
+            static_cast<const char*>(first->data),
+            static_cast<const char*>(second->data),
+            static_cast<float*>(dst->data),
+            qwen_params->txt_real_seq,
+            qwen_params->img_real_seq,
+            qwen_params->world_size);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    if (qwen_params->mode == 10) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        const ggml_tensor* recv_flat = dst->src[0];
+        GGML_ASSERT(recv_flat);
+        GGML_ASSERT(recv_flat->type == GGML_TYPE_F32);
+        GGML_ASSERT(qwen_params->stream_index == 0 || qwen_params->stream_index == 1);
+        GGML_ASSERT(qwen_params->txt_real_seq > 0);
+        GGML_ASSERT(qwen_params->img_real_seq > 0);
+        GGML_ASSERT(qwen_params->world_size > 0);
+        const int64_t stream_chunk = qwen_params->stream_index == 0 ? qwen_params->txt_real_seq :
+                                                                    qwen_params->img_real_seq;
+        GGML_ASSERT(ggml_nelements(dst) == stream_chunk * qwen_params->world_size);
+        GGML_ASSERT(recv_flat->ne[0] == (qwen_params->txt_real_seq + qwen_params->img_real_seq) *
+                                      qwen_params->world_size);
+
+        const int64_t total = ggml_nelements(dst);
+        const int threads = 256;
+        const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
+        cudaStream_t stream = ctx.stream();
+        qwen_fused_two_stream_flat_recv_unpack_f32_kernel<<<blocks, threads, 0, stream>>>(
+            static_cast<const char*>(recv_flat->data),
+            static_cast<float*>(dst->data),
+            qwen_params->stream_index,
+            qwen_params->txt_real_seq,
+            qwen_params->img_real_seq,
+            qwen_params->world_size);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    if (qwen_params->mode == 11) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        const ggml_tensor* recv_flat = dst->src[0];
+        GGML_ASSERT(recv_flat);
+        GGML_ASSERT(recv_flat->type == GGML_TYPE_F32);
+        GGML_ASSERT(qwen_params->stream_index == 0 || qwen_params->stream_index == 1);
+        GGML_ASSERT(qwen_params->txt_real_seq > 0 && qwen_params->img_real_seq > 0);
+        GGML_ASSERT(qwen_params->txt_padded_seq >= qwen_params->txt_real_seq);
+        GGML_ASSERT(qwen_params->img_padded_seq >= qwen_params->img_real_seq);
+        GGML_ASSERT(qwen_params->world_size > 0);
+        GGML_ASSERT(qwen_params->txt_padded_seq % qwen_params->world_size == 0);
+        GGML_ASSERT(qwen_params->img_padded_seq % qwen_params->world_size == 0);
+        GGML_ASSERT(dst->ne[1] == qwen_params->txt_real_seq + qwen_params->img_real_seq);
+
+        const int64_t context_shard_seq = qwen_params->txt_padded_seq / qwen_params->world_size;
+        const int64_t x_shard_seq = qwen_params->img_padded_seq / qwen_params->world_size;
+        const int64_t total_head_dim = dst->ne[0] * 3;
+        const int64_t expected = (total_head_dim * dst->ne[2] * context_shard_seq +
+                                  total_head_dim * dst->ne[2] * x_shard_seq) *
+                                 qwen_params->world_size;
+        GGML_ASSERT(recv_flat->ne[0] == expected);
+
+        const int64_t total = ggml_nelements(dst);
+        const int threads = 256;
+        const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
+        cudaStream_t stream = ctx.stream();
+        mmdit_fused_joint_qkv_to_seq_major_f32_kernel<<<blocks, threads, 0, stream>>>(
+            static_cast<const char*>(recv_flat->data),
+            static_cast<float*>(dst->data),
+            qwen_params->stream_index,
+            qwen_params->txt_real_seq,
+            qwen_params->img_real_seq,
+            qwen_params->txt_padded_seq,
+            qwen_params->img_padded_seq,
+            qwen_params->world_size,
+            dst->ne[0],
+            dst->ne[2]);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    if (qwen_params->mode == 12) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        const ggml_tensor* recv_flat = dst->src[0];
+        GGML_ASSERT(recv_flat);
+        GGML_ASSERT(recv_flat->type == GGML_TYPE_F32);
+        GGML_ASSERT(qwen_params->txt_real_seq > 0 && qwen_params->img_real_seq > 0);
+        GGML_ASSERT(qwen_params->txt_padded_seq >= qwen_params->txt_real_seq);
+        GGML_ASSERT(qwen_params->img_padded_seq >= qwen_params->img_real_seq);
+        GGML_ASSERT(qwen_params->world_size > 0);
+        GGML_ASSERT(qwen_params->txt_padded_seq % qwen_params->world_size == 0);
+        GGML_ASSERT(qwen_params->img_padded_seq % qwen_params->world_size == 0);
+        GGML_ASSERT(dst->ne[1] == qwen_params->txt_real_seq + qwen_params->img_real_seq);
+
+        const int64_t context_shard_seq = qwen_params->txt_padded_seq / qwen_params->world_size;
+        const int64_t x_shard_seq = qwen_params->img_padded_seq / qwen_params->world_size;
+        const int64_t total_head_dim = dst->ne[0] * 3;
+        const int64_t expected = (total_head_dim * dst->ne[2] * context_shard_seq +
+                                  total_head_dim * dst->ne[2] * x_shard_seq) *
+                                 qwen_params->world_size;
+        GGML_ASSERT(recv_flat->ne[0] == expected);
+
+        const int64_t total = ggml_nelements(dst);
+        const int threads = 256;
+        const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
+        cudaStream_t stream = ctx.stream();
+        mmdit_fused_joint_qkv_v_to_seq_major_f32_kernel<<<blocks, threads, 0, stream>>>(
+            static_cast<const char*>(recv_flat->data),
+            static_cast<float*>(dst->data),
+            qwen_params->txt_real_seq,
+            qwen_params->img_real_seq,
+            qwen_params->txt_padded_seq,
+            qwen_params->img_padded_seq,
+            qwen_params->world_size,
+            dst->ne[0],
+            dst->ne[2]);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    if (qwen_params->mode == 15) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        const ggml_tensor* recv_flat = dst->src[0];
+        GGML_ASSERT(recv_flat);
+        GGML_ASSERT(recv_flat->type == GGML_TYPE_F32);
+        GGML_ASSERT(qwen_params->txt_real_seq > 0 && qwen_params->img_real_seq > 0);
+        GGML_ASSERT(qwen_params->txt_padded_seq >= qwen_params->txt_real_seq);
+        GGML_ASSERT(qwen_params->img_padded_seq >= qwen_params->img_real_seq);
+        GGML_ASSERT(qwen_params->world_size > 0);
+        GGML_ASSERT(qwen_params->txt_padded_seq % qwen_params->world_size == 0);
+        GGML_ASSERT(qwen_params->img_padded_seq % qwen_params->world_size == 0);
+        GGML_ASSERT(dst->ne[1] == qwen_params->txt_real_seq + qwen_params->img_real_seq);
+
+        const int64_t context_shard_seq = qwen_params->txt_padded_seq / qwen_params->world_size;
+        const int64_t x_shard_seq = qwen_params->img_padded_seq / qwen_params->world_size;
+        const int64_t packed_dim = dst->ne[0] * 2;
+        const int64_t expected = (packed_dim * dst->ne[2] * context_shard_seq +
+                                  packed_dim * dst->ne[2] * x_shard_seq) *
+                                 qwen_params->world_size;
+        GGML_ASSERT(recv_flat->ne[0] == expected);
+
+        const int64_t total = ggml_nelements(dst);
+        const int threads = 256;
+        const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
+        cudaStream_t stream = ctx.stream();
+        mmdit_fused_joint_mixed_q_to_seq_major_kernel<<<blocks, threads, 0, stream>>>(
+            static_cast<const uint32_t*>(recv_flat->data),
+            static_cast<float*>(dst->data),
+            qwen_params->txt_real_seq,
+            qwen_params->img_real_seq,
+            qwen_params->txt_padded_seq,
+            qwen_params->img_padded_seq,
+            qwen_params->world_size,
+            dst->ne[0],
+            dst->ne[2]);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    if (qwen_params->mode == 16 || qwen_params->mode == 17) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F16);
+        const ggml_tensor* recv_flat = dst->src[0];
+        GGML_ASSERT(recv_flat);
+        GGML_ASSERT(recv_flat->type == GGML_TYPE_F32);
+        GGML_ASSERT(qwen_params->txt_real_seq > 0 && qwen_params->img_real_seq > 0);
+        GGML_ASSERT(qwen_params->txt_padded_seq >= qwen_params->txt_real_seq);
+        GGML_ASSERT(qwen_params->img_padded_seq >= qwen_params->img_real_seq);
+        GGML_ASSERT(qwen_params->world_size > 0);
+        GGML_ASSERT(qwen_params->txt_padded_seq % qwen_params->world_size == 0);
+        GGML_ASSERT(qwen_params->img_padded_seq % qwen_params->world_size == 0);
+        GGML_ASSERT(dst->ne[1] == qwen_params->txt_real_seq + qwen_params->img_real_seq);
+
+        const int64_t context_shard_seq = qwen_params->txt_padded_seq / qwen_params->world_size;
+        const int64_t x_shard_seq = qwen_params->img_padded_seq / qwen_params->world_size;
+        const int64_t packed_dim = dst->ne[0] * 2;
+        const int64_t expected = (packed_dim * dst->ne[2] * context_shard_seq +
+                                  packed_dim * dst->ne[2] * x_shard_seq) *
+                                 qwen_params->world_size;
+        GGML_ASSERT(recv_flat->ne[0] == expected);
+
+        const int64_t total = ggml_nelements(dst);
+        const int threads = 256;
+        const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
+        cudaStream_t stream = ctx.stream();
+        mmdit_fused_joint_mixed_kv_to_seq_major_kernel<<<blocks, threads, 0, stream>>>(
+            static_cast<const uint32_t*>(recv_flat->data),
+            static_cast<half*>(dst->data),
+            qwen_params->mode == 17,
+            qwen_params->txt_real_seq,
+            qwen_params->img_real_seq,
+            qwen_params->txt_padded_seq,
+            qwen_params->img_padded_seq,
+            qwen_params->world_size,
+            dst->ne[0],
+            dst->ne[2]);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    if (qwen_params->mode == 19) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        const ggml_tensor* recv_flat = dst->src[0];
+        GGML_ASSERT(recv_flat);
+        GGML_ASSERT(recv_flat->type == GGML_TYPE_F32);
+        GGML_ASSERT(qwen_params->txt_real_seq > 0 && qwen_params->img_real_seq > 0);
+        GGML_ASSERT(qwen_params->txt_padded_seq >= qwen_params->txt_real_seq);
+        GGML_ASSERT(qwen_params->img_padded_seq >= qwen_params->img_real_seq);
+        GGML_ASSERT(qwen_params->world_size > 0);
+        GGML_ASSERT(qwen_params->txt_padded_seq % qwen_params->world_size == 0);
+        GGML_ASSERT(qwen_params->img_padded_seq % qwen_params->world_size == 0);
+        GGML_ASSERT(dst->ne[1] == qwen_params->txt_real_seq + qwen_params->img_real_seq);
+
+        const int64_t context_shard_seq = qwen_params->txt_padded_seq / qwen_params->world_size;
+        const int64_t x_shard_seq = qwen_params->img_padded_seq / qwen_params->world_size;
+        const int64_t packed_dim = dst->ne[0] * 2;
+        const int64_t expected = (packed_dim * dst->ne[2] * context_shard_seq +
+                                  packed_dim * dst->ne[2] * x_shard_seq) *
+                                 qwen_params->world_size;
+        GGML_ASSERT(recv_flat->ne[0] == expected);
+
+        const int64_t total = ggml_nelements(dst);
+        const int threads = 256;
+        const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
+        cudaStream_t stream = ctx.stream();
+        mmdit_fused_joint_mixed_linear_q_to_seq_major_kernel<<<blocks, threads, 0, stream>>>(
+            static_cast<const uint32_t*>(recv_flat->data),
+            static_cast<float*>(dst->data),
+            qwen_params->txt_real_seq,
+            qwen_params->img_real_seq,
+            qwen_params->txt_padded_seq,
+            qwen_params->img_padded_seq,
+            qwen_params->world_size,
+            dst->ne[0],
+            dst->ne[2]);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    if (qwen_params->mode == 20 || qwen_params->mode == 21) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F16);
+        const ggml_tensor* recv_flat = dst->src[0];
+        GGML_ASSERT(recv_flat);
+        GGML_ASSERT(recv_flat->type == GGML_TYPE_F32);
+        GGML_ASSERT(qwen_params->txt_real_seq > 0 && qwen_params->img_real_seq > 0);
+        GGML_ASSERT(qwen_params->txt_padded_seq >= qwen_params->txt_real_seq);
+        GGML_ASSERT(qwen_params->img_padded_seq >= qwen_params->img_real_seq);
+        GGML_ASSERT(qwen_params->world_size > 0);
+        GGML_ASSERT(qwen_params->txt_padded_seq % qwen_params->world_size == 0);
+        GGML_ASSERT(qwen_params->img_padded_seq % qwen_params->world_size == 0);
+        GGML_ASSERT(dst->ne[1] == qwen_params->txt_real_seq + qwen_params->img_real_seq);
+
+        const int64_t context_shard_seq = qwen_params->txt_padded_seq / qwen_params->world_size;
+        const int64_t x_shard_seq = qwen_params->img_padded_seq / qwen_params->world_size;
+        const int64_t packed_dim = dst->ne[0] * 2;
+        const int64_t expected = (packed_dim * dst->ne[2] * context_shard_seq +
+                                  packed_dim * dst->ne[2] * x_shard_seq) *
+                                 qwen_params->world_size;
+        GGML_ASSERT(recv_flat->ne[0] == expected);
+
+        const int64_t total = ggml_nelements(dst);
+        const int threads = 256;
+        const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
+        cudaStream_t stream = ctx.stream();
+        mmdit_fused_joint_mixed_linear_kv_to_seq_major_kernel<<<blocks, threads, 0, stream>>>(
+            static_cast<const uint32_t*>(recv_flat->data),
+            static_cast<half*>(dst->data),
+            qwen_params->mode == 21,
+            qwen_params->txt_real_seq,
+            qwen_params->img_real_seq,
+            qwen_params->txt_padded_seq,
+            qwen_params->img_padded_seq,
+            qwen_params->world_size,
+            dst->ne[0],
+            dst->ne[2]);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
     if (qwen_params->mode == 7) {
         GGML_ASSERT(dst->type == GGML_TYPE_F32);
         const ggml_tensor* attn = dst->src[0];
@@ -548,6 +1382,68 @@ void ggml_cuda_op_qwen_fused_qkv_pack(ggml_backend_cuda_context& ctx, ggml_tenso
         return;
     }
 
+    if (qwen_params->mode == 13) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F16);
+        const ggml_tensor* attn = dst->src[0];
+        GGML_ASSERT(attn);
+        GGML_ASSERT(attn->type == GGML_TYPE_F32);
+        GGML_ASSERT(qwen_params->world_size > 0);
+        GGML_ASSERT(qwen_params->txt_real_seq > 0 && qwen_params->img_real_seq > 0);
+        GGML_ASSERT(qwen_params->txt_padded_seq >= qwen_params->txt_real_seq);
+        GGML_ASSERT(qwen_params->img_padded_seq >= qwen_params->img_real_seq);
+        GGML_ASSERT(qwen_params->txt_padded_seq % qwen_params->world_size == 0);
+        GGML_ASSERT(qwen_params->img_padded_seq % qwen_params->world_size == 0);
+        GGML_ASSERT(attn->ne[2] == qwen_params->txt_real_seq + qwen_params->img_real_seq);
+        GGML_ASSERT(attn->ne[3] == 1);
+
+        const int64_t total = ggml_nelements(dst);
+        const int threads = 256;
+        const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
+        cudaStream_t stream = ctx.stream();
+        qwen_fused_attn_head_to_seq_send_pack_f16_kernel<<<blocks, threads, 0, stream>>>(
+            static_cast<const char*>(attn->data),
+            static_cast<half*>(dst->data),
+            qwen_params->txt_real_seq,
+            qwen_params->img_real_seq,
+            qwen_params->txt_padded_seq,
+            qwen_params->img_padded_seq,
+            qwen_params->world_size,
+            attn->ne[0],
+            attn->ne[1],
+            attn->nb[0], attn->nb[1], attn->nb[2], attn->nb[3]);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    if (qwen_params->mode == 14) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        const ggml_tensor* recv_flat = dst->src[0];
+        GGML_ASSERT(recv_flat);
+        GGML_ASSERT(recv_flat->type == GGML_TYPE_F16);
+        GGML_ASSERT(qwen_params->world_size > 0);
+        GGML_ASSERT(qwen_params->stream_index == 0 || qwen_params->stream_index == 1);
+        GGML_ASSERT(qwen_params->txt_padded_seq > 0 && qwen_params->img_padded_seq > 0);
+        GGML_ASSERT(qwen_params->txt_padded_seq % qwen_params->world_size == 0);
+        GGML_ASSERT(qwen_params->img_padded_seq % qwen_params->world_size == 0);
+        GGML_ASSERT(dst->ne[1] % qwen_params->world_size == 0);
+
+        const int64_t total = ggml_nelements(dst);
+        const int threads = 256;
+        const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
+        cudaStream_t stream = ctx.stream();
+        qwen_fused_attn_head_to_seq_recv_unpack_f16_kernel<<<blocks, threads, 0, stream>>>(
+            static_cast<const half*>(recv_flat->data),
+            static_cast<float*>(dst->data),
+            qwen_params->stream_index,
+            qwen_params->txt_padded_seq,
+            qwen_params->img_padded_seq,
+            qwen_params->world_size,
+            dst->ne[0],
+            dst->ne[1]);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
     if (qwen_params->mode == 6) {
         GGML_ASSERT(dst->type == GGML_TYPE_F32);
         const ggml_tensor* q = dst->src[0];
@@ -572,6 +1468,41 @@ void ggml_cuda_op_qwen_fused_qkv_pack(ggml_backend_cuda_context& ctx, ggml_tenso
             static_cast<const char*>(k->data),
             static_cast<const char*>(v->data),
             static_cast<float*>(dst->data),
+            world_size,
+            q->ne[0],
+            q->ne[1],
+            q->ne[2],
+            q->nb[0], q->nb[1], q->nb[2], q->nb[3],
+            k->nb[0], k->nb[1], k->nb[2], k->nb[3],
+            v->nb[0], v->nb[1], v->nb[2], v->nb[3]);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    if (qwen_params->mode == 18) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        const ggml_tensor* q = dst->src[0];
+        const ggml_tensor* k = dst->src[1];
+        const ggml_tensor* v = dst->src[2];
+        GGML_ASSERT(q && k && v);
+        GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+        const int64_t world_size = qwen_params->txt_real_seq;
+        GGML_ASSERT(world_size > 0);
+        GGML_ASSERT(q->ne[1] % world_size == 0);
+        GGML_ASSERT(k->ne[0] == q->ne[0] && v->ne[0] == q->ne[0]);
+        GGML_ASSERT(k->ne[1] == q->ne[1] && v->ne[1] == q->ne[1]);
+        GGML_ASSERT(k->ne[2] == q->ne[2] && v->ne[2] == q->ne[2]);
+        GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1);
+
+        const int64_t total = ggml_nelements(dst);
+        const int threads = 256;
+        const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
+        cudaStream_t stream = ctx.stream();
+        qwen_fused_qkv_send_pack_mixed_kernel<<<blocks, threads, 0, stream>>>(
+            static_cast<const char*>(q->data),
+            static_cast<const char*>(k->data),
+            static_cast<const char*>(v->data),
+            static_cast<uint32_t*>(dst->data),
             world_size,
             q->ne[0],
             q->ne[1],

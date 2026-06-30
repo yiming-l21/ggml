@@ -65,6 +65,10 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml.h"
 
+#ifdef ED_ENABLE_CUDNN_SDPA
+#include "ed_cudnn_sdpa.h"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -84,11 +88,663 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
+
+struct ggml_cuda_op_profile_stat {
+    uint64_t calls = 0;
+    double total_ms = 0.0;
+};
+
+struct ggml_cuda_op_profile_graph {
+    bool active = false;
+    int graph_index = 0;
+    int n_nodes = 0;
+    ggml_cuda_op_profile_stat by_op[GGML_OP_COUNT] = {};
+};
+
+static bool ggml_cuda_op_profile_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("ED_PROFILE_CUDA_OPS");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static const char * ggml_cuda_op_profile_category(enum ggml_op op) {
+    switch (op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            return "GEMM";
+        case GGML_OP_FLASH_ATTN_EXT:
+            return "FLASH_ATTN";
+        case GGML_OP_DUP:
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_CONCAT:
+        case GGML_OP_PAD:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_TRANSPOSE:
+        case GGML_OP_VIEW:
+            return "LAYOUT";
+        case GGML_OP_ROPE:
+        case GGML_OP_ROPE_BACK:
+            return "ROPE";
+        case GGML_OP_NORM:
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_GROUP_NORM:
+        case GGML_OP_L2_NORM:
+            return "NORM";
+        case GGML_OP_ADD:
+        case GGML_OP_ADD1:
+        case GGML_OP_ADD_ID:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+        case GGML_OP_SCALE:
+        case GGML_OP_SQR:
+        case GGML_OP_SQRT:
+        case GGML_OP_SIN:
+        case GGML_OP_COS:
+        case GGML_OP_CLAMP:
+        case GGML_OP_LOG:
+        case GGML_OP_UNARY:
+        case GGML_OP_GLU:
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_MEAN:
+        case GGML_OP_SUM:
+        case GGML_OP_SUM_ROWS:
+            return "ELEMENTWISE";
+        default:
+            return "OTHER";
+    }
+}
+
+static thread_local ggml_cuda_op_profile_graph g_ggml_cuda_op_profile_graph;
+static std::atomic<int> g_ggml_cuda_op_profile_graph_counter{0};
+
+struct ggml_cuda_mul_mat_profile_key {
+    enum ggml_op op = GGML_OP_NONE;
+    std::string path;
+    enum ggml_type src0_type = GGML_TYPE_COUNT;
+    enum ggml_type src1_type = GGML_TYPE_COUNT;
+    enum ggml_type dst_type = GGML_TYPE_COUNT;
+    int64_t m = 0;
+    int64_t n = 0;
+    int64_t k = 0;
+    int64_t batch = 0;
+    int64_t src0_ne[4] = {};
+    int64_t src1_ne[4] = {};
+    int64_t dst_ne[4] = {};
+    bool src0_cont = false;
+    bool src1_cont = false;
+    bool src0_trans = false;
+    bool src1_trans = false;
+
+    bool operator==(const ggml_cuda_mul_mat_profile_key & other) const {
+        return op == other.op &&
+               path == other.path &&
+               src0_type == other.src0_type &&
+               src1_type == other.src1_type &&
+               dst_type == other.dst_type &&
+               m == other.m &&
+               n == other.n &&
+               k == other.k &&
+               batch == other.batch &&
+               src0_cont == other.src0_cont &&
+               src1_cont == other.src1_cont &&
+               src0_trans == other.src0_trans &&
+               src1_trans == other.src1_trans &&
+               std::equal(std::begin(src0_ne), std::end(src0_ne), std::begin(other.src0_ne)) &&
+               std::equal(std::begin(src1_ne), std::end(src1_ne), std::begin(other.src1_ne)) &&
+               std::equal(std::begin(dst_ne), std::end(dst_ne), std::begin(other.dst_ne));
+    }
+};
+
+struct ggml_cuda_mul_mat_profile_key_hash {
+    size_t operator()(const ggml_cuda_mul_mat_profile_key & key) const {
+        size_t h = 1469598103934665603ull;
+        auto mix = [&](uint64_t value) {
+            h ^= value;
+            h *= 1099511628211ull;
+        };
+        auto mix_str = [&](const std::string & value) {
+            for (char c : value) {
+                mix((uint64_t) (unsigned char) c);
+            }
+        };
+        mix((uint64_t) key.op);
+        mix_str(key.path);
+        mix((uint64_t) key.src0_type);
+        mix((uint64_t) key.src1_type);
+        mix((uint64_t) key.dst_type);
+        mix((uint64_t) key.m);
+        mix((uint64_t) key.n);
+        mix((uint64_t) key.k);
+        mix((uint64_t) key.batch);
+        for (int i = 0; i < 4; ++i) {
+            mix((uint64_t) key.src0_ne[i]);
+            mix((uint64_t) key.src1_ne[i]);
+            mix((uint64_t) key.dst_ne[i]);
+        }
+        mix(key.src0_cont ? 1u : 0u);
+        mix(key.src1_cont ? 1u : 0u);
+        mix(key.src0_trans ? 1u : 0u);
+        mix(key.src1_trans ? 1u : 0u);
+        return h;
+    }
+};
+
+struct ggml_cuda_mul_mat_profile_stat {
+    uint64_t calls = 0;
+    double total_ms = 0.0;
+};
+
+struct ggml_cuda_mul_mat_internal_profile_key {
+    std::string branch;
+    std::string stage;
+    enum ggml_type src0_type = GGML_TYPE_COUNT;
+    enum ggml_type src1_type = GGML_TYPE_COUNT;
+    enum ggml_type dst_type = GGML_TYPE_COUNT;
+    int64_t m = 0;
+    int64_t n = 0;
+    int64_t k = 0;
+    int64_t batch = 0;
+
+    bool operator==(const ggml_cuda_mul_mat_internal_profile_key & other) const {
+        return branch == other.branch &&
+               stage == other.stage &&
+               src0_type == other.src0_type &&
+               src1_type == other.src1_type &&
+               dst_type == other.dst_type &&
+               m == other.m &&
+               n == other.n &&
+               k == other.k &&
+               batch == other.batch;
+    }
+};
+
+struct ggml_cuda_mul_mat_internal_profile_key_hash {
+    size_t operator()(const ggml_cuda_mul_mat_internal_profile_key & key) const {
+        size_t h = 1469598103934665603ull;
+        auto mix = [&](uint64_t value) {
+            h ^= value;
+            h *= 1099511628211ull;
+        };
+        auto mix_str = [&](const std::string & value) {
+            for (char c : value) {
+                mix((uint64_t) (unsigned char) c);
+            }
+        };
+        mix_str(key.branch);
+        mix_str(key.stage);
+        mix((uint64_t) key.src0_type);
+        mix((uint64_t) key.src1_type);
+        mix((uint64_t) key.dst_type);
+        mix((uint64_t) key.m);
+        mix((uint64_t) key.n);
+        mix((uint64_t) key.k);
+        mix((uint64_t) key.batch);
+        return h;
+    }
+};
+
+struct ggml_cuda_mul_mat_internal_profile_stat {
+    uint64_t calls = 0;
+    double total_ms = 0.0;
+};
+
+struct ggml_cuda_mul_mat_profile_graph {
+    bool active = false;
+    int graph_index = 0;
+    int n_nodes = 0;
+    std::unordered_map<ggml_cuda_mul_mat_profile_key, ggml_cuda_mul_mat_profile_stat, ggml_cuda_mul_mat_profile_key_hash> by_key;
+    std::unordered_map<ggml_cuda_mul_mat_internal_profile_key, ggml_cuda_mul_mat_internal_profile_stat, ggml_cuda_mul_mat_internal_profile_key_hash> internal_by_key;
+};
+
+static thread_local ggml_cuda_mul_mat_profile_graph g_ggml_cuda_mul_mat_profile_graph;
+
+static bool ggml_cuda_mul_mat_profile_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("ED_PROFILE_CUDA_MUL_MAT");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static int ggml_cuda_mul_mat_profile_top_k() {
+    static const int top_k = [] {
+        const char * env = getenv("ED_PROFILE_CUDA_MUL_MAT_TOPK");
+        if (env == nullptr || env[0] == '\0') {
+            return 20;
+        }
+        const int value = atoi(env);
+        return value > 0 ? value : 20;
+    }();
+    return top_k;
+}
+
+static bool ggml_cuda_mul_mat_internal_profile_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("ED_PROFILE_CUDA_MUL_MAT_INTERNAL");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static void ggml_cuda_op_profile_begin_graph(int n_nodes) {
+    const bool op_profile_enabled = ggml_cuda_op_profile_enabled();
+    const bool mul_mat_profile_enabled =
+        ggml_cuda_mul_mat_profile_enabled() || ggml_cuda_mul_mat_internal_profile_enabled();
+
+    if (!op_profile_enabled && !mul_mat_profile_enabled) {
+        g_ggml_cuda_op_profile_graph.active = false;
+        g_ggml_cuda_mul_mat_profile_graph.active = false;
+        return;
+    }
+
+    const int graph_index = g_ggml_cuda_op_profile_graph_counter.fetch_add(1, std::memory_order_relaxed);
+
+    if (!op_profile_enabled) {
+        g_ggml_cuda_op_profile_graph.active = false;
+    } else {
+    g_ggml_cuda_op_profile_graph = {};
+    g_ggml_cuda_op_profile_graph.active = true;
+    g_ggml_cuda_op_profile_graph.n_nodes = n_nodes;
+        g_ggml_cuda_op_profile_graph.graph_index = graph_index;
+    }
+
+    if (!mul_mat_profile_enabled) {
+        g_ggml_cuda_mul_mat_profile_graph.active = false;
+    } else {
+        g_ggml_cuda_mul_mat_profile_graph = {};
+        g_ggml_cuda_mul_mat_profile_graph.active = true;
+        g_ggml_cuda_mul_mat_profile_graph.n_nodes = n_nodes;
+        g_ggml_cuda_mul_mat_profile_graph.graph_index = graph_index;
+    }
+}
+
+static void ggml_cuda_op_profile_record(enum ggml_op op, double elapsed_ms) {
+    if (!g_ggml_cuda_op_profile_graph.active || op < 0 || op >= GGML_OP_COUNT) {
+        return;
+    }
+    ggml_cuda_op_profile_stat & stat = g_ggml_cuda_op_profile_graph.by_op[op];
+    stat.calls++;
+    stat.total_ms += elapsed_ms;
+}
+
+static void ggml_cuda_op_profile_end_graph(cudaStream_t stream) {
+    if (!g_ggml_cuda_op_profile_graph.active && !g_ggml_cuda_mul_mat_profile_graph.active) {
+        return;
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    if (g_ggml_cuda_mul_mat_profile_graph.active) {
+        struct row {
+            ggml_cuda_mul_mat_profile_key key;
+            ggml_cuda_mul_mat_profile_stat stat;
+        };
+
+        std::vector<row> rows;
+        rows.reserve(g_ggml_cuda_mul_mat_profile_graph.by_key.size());
+        double total_ms = 0.0;
+        uint64_t total_calls = 0;
+        for (const auto & item : g_ggml_cuda_mul_mat_profile_graph.by_key) {
+            rows.push_back({ item.first, item.second });
+            total_ms += item.second.total_ms;
+            total_calls += item.second.calls;
+        }
+
+        std::sort(rows.begin(), rows.end(), [](const row & a, const row & b) {
+            return a.stat.total_ms > b.stat.total_ms;
+        });
+
+        GGML_LOG_INFO("ED_CUDA_MUL_MAT_PROFILE graph=%d nodes=%d groups=%zu calls=%" PRIu64 " total_ms=%.3f\n",
+                      g_ggml_cuda_mul_mat_profile_graph.graph_index,
+                      g_ggml_cuda_mul_mat_profile_graph.n_nodes,
+                      rows.size(),
+                      total_calls,
+                      total_ms);
+
+        const int top_k = ggml_cuda_mul_mat_profile_top_k();
+        for (int i = 0; i < (int) rows.size() && i < top_k; ++i) {
+            const row & r = rows[i];
+            const ggml_cuda_mul_mat_profile_key & key = r.key;
+            GGML_LOG_INFO(
+                "ED_CUDA_MUL_MAT_PROFILE_TOP graph=%d rank=%d op=%s path=%s calls=%" PRIu64
+                " total_ms=%.3f mean_us=%.3f m=%" PRId64 " n=%" PRId64 " k=%" PRId64 " batch=%" PRId64
+                " src0_type=%s src1_type=%s dst_type=%s"
+                " src0_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]"
+                " src1_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]"
+                " dst_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]"
+                " src0_cont=%d src1_cont=%d src0_trans=%d src1_trans=%d\n",
+                g_ggml_cuda_mul_mat_profile_graph.graph_index,
+                i,
+                ggml_op_name(key.op),
+                key.path.c_str(),
+                r.stat.calls,
+                r.stat.total_ms,
+                r.stat.total_ms * 1000.0 / static_cast<double>(r.stat.calls),
+                key.m,
+                key.n,
+                key.k,
+                key.batch,
+                ggml_type_name(key.src0_type),
+                ggml_type_name(key.src1_type),
+                ggml_type_name(key.dst_type),
+                key.src0_ne[0], key.src0_ne[1], key.src0_ne[2], key.src0_ne[3],
+                key.src1_ne[0], key.src1_ne[1], key.src1_ne[2], key.src1_ne[3],
+                key.dst_ne[0], key.dst_ne[1], key.dst_ne[2], key.dst_ne[3],
+                key.src0_cont ? 1 : 0,
+                key.src1_cont ? 1 : 0,
+                key.src0_trans ? 1 : 0,
+                key.src1_trans ? 1 : 0);
+        }
+
+        if (!g_ggml_cuda_mul_mat_profile_graph.internal_by_key.empty()) {
+            struct internal_row {
+                ggml_cuda_mul_mat_internal_profile_key key;
+                ggml_cuda_mul_mat_internal_profile_stat stat;
+            };
+
+            std::vector<internal_row> internal_rows;
+            internal_rows.reserve(g_ggml_cuda_mul_mat_profile_graph.internal_by_key.size());
+            double internal_total_ms = 0.0;
+            uint64_t internal_total_calls = 0;
+            for (const auto & item : g_ggml_cuda_mul_mat_profile_graph.internal_by_key) {
+                internal_rows.push_back({ item.first, item.second });
+                internal_total_ms += item.second.total_ms;
+                internal_total_calls += item.second.calls;
+            }
+
+            std::sort(internal_rows.begin(), internal_rows.end(), [](const internal_row & a, const internal_row & b) {
+                return a.stat.total_ms > b.stat.total_ms;
+            });
+
+            GGML_LOG_INFO("ED_CUDA_MUL_MAT_INTERNAL_PROFILE graph=%d nodes=%d groups=%zu calls=%" PRIu64 " total_ms=%.3f\n",
+                          g_ggml_cuda_mul_mat_profile_graph.graph_index,
+                          g_ggml_cuda_mul_mat_profile_graph.n_nodes,
+                          internal_rows.size(),
+                          internal_total_calls,
+                          internal_total_ms);
+
+            const int top_k = ggml_cuda_mul_mat_profile_top_k();
+            for (int i = 0; i < (int) internal_rows.size() && i < top_k; ++i) {
+                const internal_row & r = internal_rows[i];
+                const ggml_cuda_mul_mat_internal_profile_key & key = r.key;
+                GGML_LOG_INFO(
+                    "ED_CUDA_MUL_MAT_INTERNAL_PROFILE_TOP graph=%d rank=%d branch=%s stage=%s calls=%" PRIu64
+                    " total_ms=%.3f mean_us=%.3f m=%" PRId64 " n=%" PRId64 " k=%" PRId64 " batch=%" PRId64
+                    " src0_type=%s src1_type=%s dst_type=%s\n",
+                    g_ggml_cuda_mul_mat_profile_graph.graph_index,
+                    i,
+                    key.branch.c_str(),
+                    key.stage.c_str(),
+                    r.stat.calls,
+                    r.stat.total_ms,
+                    r.stat.total_ms * 1000.0 / static_cast<double>(r.stat.calls),
+                    key.m,
+                    key.n,
+                    key.k,
+                    key.batch,
+                    ggml_type_name(key.src0_type),
+                    ggml_type_name(key.src1_type),
+                    ggml_type_name(key.dst_type));
+            }
+        }
+
+        g_ggml_cuda_mul_mat_profile_graph.active = false;
+    }
+
+    if (!g_ggml_cuda_op_profile_graph.active) {
+        return;
+    }
+
+    struct category_stat {
+        uint64_t calls = 0;
+        double total_ms = 0.0;
+    };
+
+    std::unordered_map<std::string, category_stat> categories;
+    double total_ms = 0.0;
+    uint64_t total_calls = 0;
+
+    for (int i = 0; i < GGML_OP_COUNT; ++i) {
+        const ggml_cuda_op_profile_stat & stat = g_ggml_cuda_op_profile_graph.by_op[i];
+        if (stat.calls == 0) {
+            continue;
+        }
+        const char * category_name = ggml_cuda_op_profile_category(static_cast<enum ggml_op>(i));
+        category_stat & category = categories[category_name];
+        category.calls += stat.calls;
+        category.total_ms += stat.total_ms;
+        total_calls += stat.calls;
+        total_ms += stat.total_ms;
+    }
+
+    GGML_LOG_INFO("ED_CUDA_OP_PROFILE graph=%d nodes=%d calls=%" PRIu64 " total_ms=%.3f\n",
+                  g_ggml_cuda_op_profile_graph.graph_index,
+                  g_ggml_cuda_op_profile_graph.n_nodes,
+                  total_calls,
+                  total_ms);
+
+    const char * category_order[] = {
+        "GEMM", "FLASH_ATTN", "LAYOUT", "ROPE", "NORM", "ELEMENTWISE", "OTHER",
+    };
+    for (const char * category_name : category_order) {
+        auto it = categories.find(category_name);
+        if (it == categories.end() || it->second.calls == 0) {
+            continue;
+        }
+        const category_stat & category = it->second;
+        GGML_LOG_INFO("ED_CUDA_OP_PROFILE_CATEGORY graph=%d category=%s calls=%" PRIu64 " total_ms=%.3f mean_us=%.3f\n",
+                      g_ggml_cuda_op_profile_graph.graph_index,
+                      category_name,
+                      category.calls,
+                      category.total_ms,
+                      category.total_ms * 1000.0 / static_cast<double>(category.calls));
+    }
+
+    for (int i = 0; i < GGML_OP_COUNT; ++i) {
+        const ggml_cuda_op_profile_stat & stat = g_ggml_cuda_op_profile_graph.by_op[i];
+        if (stat.calls == 0) {
+            continue;
+        }
+        GGML_LOG_INFO("ED_CUDA_OP_PROFILE_OP graph=%d op=%s calls=%" PRIu64 " total_ms=%.3f mean_us=%.3f\n",
+                      g_ggml_cuda_op_profile_graph.graph_index,
+                      ggml_op_name(static_cast<enum ggml_op>(i)),
+                      stat.calls,
+                      stat.total_ms,
+                      stat.total_ms * 1000.0 / static_cast<double>(stat.calls));
+    }
+
+    g_ggml_cuda_op_profile_graph.active = false;
+}
+
+static bool ggml_cuda_attention_neighborhood_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("ED_PROFILE_ATTENTION_NEIGHBORHOOD");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static int ggml_cuda_env_int(const char * name, int default_value) {
+    const char * env = getenv(name);
+    if (env == nullptr || env[0] == '\0') {
+        return default_value;
+    }
+    const int value = atoi(env);
+    return value > 0 ? value : default_value;
+}
+
+static int ggml_cuda_attention_neighborhood_limit() {
+    static const int value = ggml_cuda_env_int("ED_PROFILE_ATTENTION_NEIGHBORHOOD_LIMIT", 3);
+    return value;
+}
+
+static int ggml_cuda_attention_neighborhood_radius() {
+    static const int value = ggml_cuda_env_int("ED_PROFILE_ATTENTION_NEIGHBORHOOD_RADIUS", 5);
+    return value;
+}
+
+static int ggml_cuda_attention_neighborhood_graph_limit() {
+    static const int value = ggml_cuda_env_int("ED_PROFILE_ATTENTION_NEIGHBORHOOD_GRAPHS", 1);
+    return value;
+}
+
+static const char * ggml_cuda_tensor_buffer_name(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        return "none";
+    }
+    return ggml_backend_buffer_name(tensor->buffer);
+}
+
+static void ggml_cuda_log_tensor_meta(const char * prefix, int idx, const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        GGML_LOG_INFO("%s idx=%d null\n", prefix, idx);
+        return;
+    }
+    GGML_LOG_INFO(
+        "%s idx=%d op=%s type=%s name=\"%s\" ne=[%lld,%lld,%lld,%lld] "
+        "nb=[%zu,%zu,%zu,%zu] data=%p view_src=%p view_offs=%zu buffer=%s flags=0x%x\n",
+        prefix,
+        idx,
+        ggml_op_name(tensor->op),
+        ggml_type_name(tensor->type),
+        tensor->name,
+        (long long) tensor->ne[0],
+        (long long) tensor->ne[1],
+        (long long) tensor->ne[2],
+        (long long) tensor->ne[3],
+        tensor->nb[0],
+        tensor->nb[1],
+        tensor->nb[2],
+        tensor->nb[3],
+        tensor->data,
+        (void *) tensor->view_src,
+        tensor->view_offs,
+        ggml_cuda_tensor_buffer_name(tensor),
+        tensor->flags);
+}
+
+static void ggml_cuda_log_attention_neighborhood(const ggml_cgraph * cgraph) {
+    if (!ggml_cuda_attention_neighborhood_enabled()) {
+        return;
+    }
+
+    std::vector<int> attention_indices;
+    attention_indices.reserve(ggml_cuda_attention_neighborhood_limit());
+    for (int i = 0; i < cgraph->n_nodes && (int) attention_indices.size() < ggml_cuda_attention_neighborhood_limit(); ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node != nullptr && node->op == GGML_OP_FLASH_ATTN_EXT) {
+            attention_indices.push_back(i);
+        }
+    }
+
+    if (attention_indices.empty()) {
+        return;
+    }
+
+    static std::atomic<int> graph_counter{0};
+    const int graph_index = graph_counter.fetch_add(1, std::memory_order_relaxed);
+    if (graph_index >= ggml_cuda_attention_neighborhood_graph_limit()) {
+        return;
+    }
+
+    const int radius = ggml_cuda_attention_neighborhood_radius();
+    int seen = 0;
+
+    for (int i : attention_indices) {
+        const ggml_tensor * node = cgraph->nodes[i];
+
+        GGML_LOG_INFO("ED_ATTENTION_NEIGHBORHOOD graph=%d attention=%d node_idx=%d radius=%d nodes=%d\n",
+                      graph_index,
+                      seen,
+                      i,
+                      radius,
+                      cgraph->n_nodes);
+        const int begin = std::max(0, i - radius);
+        const int end = std::min(cgraph->n_nodes - 1, i + radius);
+        for (int j = begin; j <= end; ++j) {
+            const char * role = j < i ? "before" : (j == i ? "attention" : "after");
+            GGML_LOG_INFO("ED_ATTENTION_NEIGHBORHOOD_NODE graph=%d attention=%d rel=%d role=%s\n",
+                          graph_index,
+                          seen,
+                          j - i,
+                          role);
+            ggml_cuda_log_tensor_meta("ED_ATTENTION_NEIGHBORHOOD_TENSOR", j, cgraph->nodes[j]);
+        }
+
+        for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
+            if (node->src[src_idx] == nullptr) {
+                continue;
+            }
+            GGML_LOG_INFO("ED_ATTENTION_NEIGHBORHOOD_SRC graph=%d attention=%d src=%d\n",
+                          graph_index,
+                          seen,
+                          src_idx);
+            ggml_cuda_log_tensor_meta("ED_ATTENTION_NEIGHBORHOOD_SRC_TENSOR", src_idx, node->src[src_idx]);
+        }
+
+        seen++;
+    }
+}
+
+static bool ggml_cuda_graph_status_profile_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("ED_PROFILE_CUDA_GRAPH_STATUS");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static void ggml_cuda_log_graph_status(const ggml_cgraph * cgraph,
+                                       const void * graph_key,
+                                       bool cuda_graphs_compiled,
+                                       bool graph_enabled,
+                                       bool graph_compatible,
+                                       bool properties_changed,
+                                       bool warmup_complete,
+                                       bool graph_has_instance,
+                                       bool use_cuda_graph,
+                                       bool cuda_graph_update_required,
+                                       const char * reason) {
+    if (!ggml_cuda_graph_status_profile_enabled()) {
+        return;
+    }
+    static std::atomic<int> graph_status_counter{0};
+    const int graph_index = graph_status_counter.fetch_add(1, std::memory_order_relaxed);
+    const char * phase = "direct";
+    if (use_cuda_graph && cuda_graph_update_required) {
+        phase = "capture";
+    } else if (use_cuda_graph) {
+        phase = "replay";
+    }
+    GGML_LOG_INFO(
+        "ED_CUDA_GRAPH_STATUS graph=%d nodes=%d key=%p compiled=%d enabled=%d compatible=%d "
+        "properties_changed=%d warmup_complete=%d has_instance=%d use_cuda_graph=%d update_required=%d "
+        "phase=%s reason=%s\n",
+        graph_index,
+        cgraph != nullptr ? cgraph->n_nodes : 0,
+        graph_key,
+        cuda_graphs_compiled ? 1 : 0,
+        graph_enabled ? 1 : 0,
+        graph_compatible ? 1 : 0,
+        properties_changed ? 1 : 0,
+        warmup_complete ? 1 : 0,
+        graph_has_instance ? 1 : 0,
+        use_cuda_graph ? 1 : 0,
+        cuda_graph_update_required ? 1 : 0,
+        phase,
+        reason);
+}
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
@@ -1621,6 +2277,87 @@ static const cublas_force_compute_type & ggml_cuda_cublas_get_force_compute_type
     return compute_type;
 }
 
+static ggml_cuda_mul_mat_internal_profile_key ggml_cuda_mul_mat_internal_profile_make_key(
+        const char * branch,
+        const char * stage,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst,
+        int64_t row_diff,
+        int64_t src1_ncols,
+        int64_t ne10) {
+    ggml_cuda_mul_mat_internal_profile_key key;
+    key.branch = branch;
+    key.stage = stage;
+    key.src0_type = src0->type;
+    key.src1_type = src1->type;
+    key.dst_type = dst->type;
+    key.m = row_diff;
+    key.n = src1_ncols;
+    key.k = ne10;
+    key.batch = std::max<int64_t>(1, src1->ne[2] * src1->ne[3]);
+    return key;
+}
+
+static void ggml_cuda_mul_mat_internal_profile_record(
+        const char * branch,
+        const char * stage,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst,
+        int64_t row_diff,
+        int64_t src1_ncols,
+        int64_t ne10,
+        double elapsed_ms) {
+    if (!g_ggml_cuda_mul_mat_profile_graph.active || !ggml_cuda_mul_mat_internal_profile_enabled()) {
+        return;
+    }
+
+    ggml_cuda_mul_mat_internal_profile_key key =
+        ggml_cuda_mul_mat_internal_profile_make_key(branch, stage, src0, src1, dst, row_diff, src1_ncols, ne10);
+    ggml_cuda_mul_mat_internal_profile_stat & stat = g_ggml_cuda_mul_mat_profile_graph.internal_by_key[key];
+    stat.calls++;
+    stat.total_ms += elapsed_ms;
+}
+
+static cudaEvent_t ggml_cuda_mul_mat_internal_profile_start(cudaStream_t stream) {
+    if (!g_ggml_cuda_mul_mat_profile_graph.active || !ggml_cuda_mul_mat_internal_profile_enabled()) {
+        return nullptr;
+    }
+
+    cudaEvent_t start;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventRecord(start, stream));
+    return start;
+}
+
+static void ggml_cuda_mul_mat_internal_profile_stop(
+        cudaEvent_t start,
+        cudaStream_t stream,
+        const char * branch,
+        const char * stage,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst,
+        int64_t row_diff,
+        int64_t src1_ncols,
+        int64_t ne10) {
+    if (start == nullptr) {
+        return;
+    }
+
+    cudaEvent_t stop;
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    float elapsed_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    ggml_cuda_mul_mat_internal_profile_record(branch, stage, src0, src1, dst, row_diff, src1_ncols, ne10, elapsed_ms);
+}
+
 static void ggml_cuda_op_mul_mat_cublas(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
@@ -1663,16 +2400,20 @@ static void ggml_cuda_op_mul_mat_cublas(
             GGML_ASSERT(to_bf16_cuda != nullptr);
             size_t ne = src1_ncols*ne10;
             src1_as_bf16.alloc(ne);
+            cudaEvent_t profile_start = ggml_cuda_mul_mat_internal_profile_start(stream);
             to_bf16_cuda(src1_ddf_i, src1_as_bf16.get(), ne, stream);
+            ggml_cuda_mul_mat_internal_profile_stop(
+                profile_start, stream, "bf16", "src1_to_bf16", src0, src1, dst, row_diff, src1_ncols, ne10);
         }
         const nv_bfloat16 * src1_ptr = src1->type == GGML_TYPE_BF16 ? (const nv_bfloat16 *) src1_ddf_i : src1_as_bf16.get();
         const nv_bfloat16 * src0_ptr = (const nv_bfloat16 *)src0_dd_i;
-        ggml_cuda_pool_alloc<nv_bfloat16> dst_bf16(ctx.pool(id), row_diff*src1_ncols);
 
         const float alpha_f32 = 1.0f;
         const float beta_f32  = 0.0f;
 
         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+        ggml_cuda_pool_alloc<nv_bfloat16> dst_bf16(ctx.pool(id), row_diff*src1_ncols);
+        cudaEvent_t profile_start = ggml_cuda_mul_mat_internal_profile_start(stream);
         CUBLAS_CHECK(
             cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                     row_diff, src1_ncols, ne10,
@@ -1681,9 +2422,14 @@ static void ggml_cuda_op_mul_mat_cublas(
                     &beta_f32,   dst_bf16.get(), CUDA_R_16BF, ldc,
                     CUBLAS_COMPUTE_32F,
                     CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        ggml_cuda_mul_mat_internal_profile_stop(
+            profile_start, stream, "bf16", "gemm", src0, src1, dst, row_diff, src1_ncols, ne10);
 
         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+        profile_start = ggml_cuda_mul_mat_internal_profile_start(stream);
         to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+        ggml_cuda_mul_mat_internal_profile_stop(
+            profile_start, stream, "bf16", "dst_to_f32", src0, src1, dst, row_diff, src1_ncols, ne10);
     } else if (fast_fp16_hardware_available(cc) && use_fp16) {
         // convert src0 and src1 to fp16, multiply as fp16, convert dst to fp32
         ggml_cuda_pool_alloc<half> src0_as_f16(ctx.pool(id));
@@ -1692,7 +2438,10 @@ static void ggml_cuda_op_mul_mat_cublas(
             GGML_ASSERT(to_fp16_cuda != nullptr);
             size_t ne = row_diff*ne00;
             src0_as_f16.alloc(ne);
+            cudaEvent_t profile_start = ggml_cuda_mul_mat_internal_profile_start(stream);
             to_fp16_cuda(src0_dd_i, src0_as_f16.get(), ne, stream);
+            ggml_cuda_mul_mat_internal_profile_stop(
+                profile_start, stream, "fp16", "src0_to_f16", src0, src1, dst, row_diff, src1_ncols, ne10);
         }
         const half * src0_ptr = src0->type == GGML_TYPE_F16 ? (const half *) src0_dd_i : src0_as_f16.get();
 
@@ -1702,7 +2451,10 @@ static void ggml_cuda_op_mul_mat_cublas(
             GGML_ASSERT(to_fp16_cuda != nullptr);
             size_t ne = src1_ncols*ne10;
             src1_as_f16.alloc(ne);
+            cudaEvent_t profile_start = ggml_cuda_mul_mat_internal_profile_start(stream);
             to_fp16_cuda(src1_ddf_i, src1_as_f16.get(), ne, stream);
+            ggml_cuda_mul_mat_internal_profile_stop(
+                profile_start, stream, "fp16", "src1_to_f16", src0, src1, dst, row_diff, src1_ncols, ne10);
         }
         const half * src1_ptr = src1->type == GGML_TYPE_F16 ? (const half *) src1_ddf_i : src1_as_f16.get();
 
@@ -1717,6 +2469,7 @@ static void ggml_cuda_op_mul_mat_cublas(
         {
             const float alpha = 1.0f;
             const float beta = 0.0f;
+            cudaEvent_t profile_start = ggml_cuda_mul_mat_internal_profile_start(stream);
             CUBLAS_CHECK(
                 cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                         row_diff, src1_ncols, ne10,
@@ -1725,12 +2478,15 @@ static void ggml_cuda_op_mul_mat_cublas(
                         &beta,   dst_dd_i, CUDA_R_32F, ldc,
                         CUBLAS_COMPUTE_32F,
                         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            ggml_cuda_mul_mat_internal_profile_stop(
+                profile_start, stream, "fp16", "gemm_f32_dst", src0, src1, dst, row_diff, src1_ncols, ne10);
         } else {
             ggml_cuda_pool_alloc<half> dst_f16(ctx.pool(id), row_diff*src1_ncols);
 
             const half alpha_f16 = 1.0f;
             const half beta_f16 = 0.0f;
 
+            cudaEvent_t profile_start = ggml_cuda_mul_mat_internal_profile_start(stream);
             CUBLAS_CHECK(
                 cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                         row_diff, src1_ncols, ne10,
@@ -1739,9 +2495,14 @@ static void ggml_cuda_op_mul_mat_cublas(
                         &beta_f16,  dst_f16.get(), CUDA_R_16F, ldc,
                         CUBLAS_COMPUTE_16F,
                         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            ggml_cuda_mul_mat_internal_profile_stop(
+                profile_start, stream, "fp16", "gemm_f16_dst", src0, src1, dst, row_diff, src1_ncols, ne10);
 
             const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+            profile_start = ggml_cuda_mul_mat_internal_profile_start(stream);
             to_fp32_cuda(dst_f16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+            ggml_cuda_mul_mat_internal_profile_stop(
+                profile_start, stream, "fp16", "dst_to_f32", src0, src1, dst, row_diff, src1_ncols, ne10);
         }
     } else {
         ggml_cuda_pool_alloc<float> src0_ddq_as_f32(ctx.pool(id));
@@ -1751,13 +2512,19 @@ static void ggml_cuda_op_mul_mat_cublas(
             const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src0->type);
             GGML_ASSERT(to_fp32_cuda != nullptr);
             src0_ddq_as_f32.alloc(row_diff*ne00);
+            cudaEvent_t profile_start = ggml_cuda_mul_mat_internal_profile_start(stream);
             to_fp32_cuda(src0_dd_i, src0_ddq_as_f32.get(), row_diff*ne00, stream);
+            ggml_cuda_mul_mat_internal_profile_stop(
+                profile_start, stream, "f32", "src0_to_f32", src0, src1, dst, row_diff, src1_ncols, ne10);
         }
         if (src1->type != GGML_TYPE_F32) {
             const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src1->type);
             GGML_ASSERT(to_fp32_cuda != nullptr);
             src1_ddq_as_f32.alloc(src1_ncols*ne10);
+            cudaEvent_t profile_start = ggml_cuda_mul_mat_internal_profile_start(stream);
             to_fp32_cuda(src1_ddf_i, src1_ddq_as_f32.get(), src1_ncols*ne10, stream);
+            ggml_cuda_mul_mat_internal_profile_stop(
+                profile_start, stream, "f32", "src1_to_f32", src0, src1, dst, row_diff, src1_ncols, ne10);
         }
 
         const float * src0_ddf_i = src0->type == GGML_TYPE_F32 ? (const float *) src0_dd_i : src0_ddq_as_f32.get();
@@ -1767,12 +2534,15 @@ static void ggml_cuda_op_mul_mat_cublas(
         const float beta = 0.0f;
 
         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+        cudaEvent_t profile_start = ggml_cuda_mul_mat_internal_profile_start(stream);
         CUBLAS_CHECK(
             cublasSgemm(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                     row_diff, src1_ncols, ne10,
                     &alpha, src0_ddf_i,  ne00,
                             src1_ddf1_i, ne10,
                     &beta,  dst_dd_i,    ldc));
+        ggml_cuda_mul_mat_internal_profile_stop(
+            profile_start, stream, "f32", "sgemm", src0, src1, dst, row_diff, src1_ncols, ne10);
     }
 
     GGML_UNUSED_VARS(dst, src1_ddq_i, src1_padded_row_size);
@@ -2777,7 +3547,165 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+static const char * ggml_cuda_mul_mat_profile_infer_path(const ggml_tensor * dst) {
+    if (dst == nullptr || dst->src[0] == nullptr || dst->src[1] == nullptr) {
+        return "unknown";
+    }
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    if (dst->op == GGML_OP_MUL_MAT_ID) {
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+            if (src1->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
+                if (ggml_is_quantized(src0->type)) {
+                    const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+                    if (src1->ne[2] <= mmvq_mmid_max) {
+                        return "mul_mat_id_vec_q";
+                    }
+                } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+                    return "mul_mat_id_vec_f";
+                }
+            }
+            if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
+                return "mul_mat_id_mmq";
+            }
+            if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+                return "mul_mat_id_mmf";
+            }
+        }
+        return "mul_mat_id_sort";
+    }
+
+    const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+
+    bool use_mul_mat_vec_f = (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16)
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+    bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+        && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+    bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+
+    bool any_gpus_with_slow_fp16 = false;
+
+    if (split) {
+        ggml_backend_cuda_split_buffer_type_context * buft_ctx = (ggml_backend_cuda_split_buffer_type_context *) src0->buffer->buft->context;
+        auto & tensor_split = buft_ctx->tensor_split;
+        for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
+            if (tensor_split[id] >= (id + 1 < ggml_backend_cuda_get_device_count() ? tensor_split[id + 1] : 1.0f)) {
+                continue;
+            }
+            const int cc        = ggml_cuda_info().devices[id].cc;
+            const int warp_size = ggml_cuda_info().devices[id].warp_size;
+            use_mul_mat_q           = use_mul_mat_q       && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
+            use_mul_mat_f           = use_mul_mat_f       && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
+            use_mul_mat_vec_f       = use_mul_mat_vec_f   && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
+            any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16 || !fast_fp16_hardware_available(cc);
+        }
+    } else {
+        const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+        use_mul_mat_q           = use_mul_mat_q       && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
+        use_mul_mat_f           = use_mul_mat_f       && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
+        use_mul_mat_vec_f       = use_mul_mat_vec_f   && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
+        any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16 || !fast_fp16_hardware_available(cc);
+    }
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool use_batched_cublas_f16  = src0->type == GGML_TYPE_F16 && (src1->type == GGML_TYPE_F16 || !any_gpus_with_slow_fp16);
+    const bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
+    const bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
+
+    if (!split && use_mul_mat_vec_f) {
+        return "vec_f";
+    }
+    if (!split && use_mul_mat_f) {
+        return "mmf";
+    }
+    if (!split && use_mul_mat_vec_q) {
+        return "vec_q";
+    }
+    if (!split && use_mul_mat_q) {
+        return "mmq";
+    }
+    if (!split && (use_batched_cublas_f16 || use_batched_cublas_bf16 || use_batched_cublas_f32)
+        && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2]*src1->ne[3] > 1) {
+        if (src1->ne[2] % src0->ne[2] == 0 && src1->ne[3] % src0->ne[3] == 0 &&
+            src1->ne[2] / src0->ne[2] == 1 && src1->ne[3] / src0->ne[3] == 1 &&
+            ggml_is_contiguous_2(src0) && ggml_is_contiguous_2(src1)) {
+            return "batched_cublas_strided";
+        }
+        return "batched_cublas_ptrs";
+    }
+    if (use_mul_mat_vec_f) {
+        return "op_vec_f";
+    }
+    if (use_mul_mat_vec_q) {
+        return "op_vec_q";
+    }
+    if (use_mul_mat_q) {
+        return "op_mmq";
+    }
+    return "op_cublas";
+}
+
+static ggml_cuda_mul_mat_profile_key ggml_cuda_mul_mat_profile_make_key(const ggml_tensor * dst) {
+    ggml_cuda_mul_mat_profile_key key;
+    key.op = dst->op;
+    key.path = ggml_cuda_mul_mat_profile_infer_path(dst);
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    key.src0_type = src0->type;
+    key.src1_type = src1->type;
+    key.dst_type = dst->type;
+    key.m = dst->ne[0];
+    key.n = dst->ne[1];
+    key.k = src0->ne[0];
+    key.batch = std::max<int64_t>(1, src1->ne[2] * src1->ne[3]);
+    for (int i = 0; i < 4; ++i) {
+        key.src0_ne[i] = src0->ne[i];
+        key.src1_ne[i] = src1->ne[i];
+        key.dst_ne[i] = dst->ne[i];
+    }
+    key.src0_cont = ggml_is_contiguous(src0);
+    key.src1_cont = ggml_is_contiguous(src1);
+    key.src0_trans = ggml_is_transposed(src0);
+    key.src1_trans = ggml_is_transposed(src1);
+    return key;
+}
+
+static void ggml_cuda_mul_mat_profile_record(const ggml_tensor * dst, double elapsed_ms) {
+    if (!g_ggml_cuda_mul_mat_profile_graph.active ||
+        (dst->op != GGML_OP_MUL_MAT && dst->op != GGML_OP_MUL_MAT_ID) ||
+        dst->src[0] == nullptr || dst->src[1] == nullptr) {
+        return;
+    }
+
+    ggml_cuda_mul_mat_profile_key key = ggml_cuda_mul_mat_profile_make_key(dst);
+    ggml_cuda_mul_mat_profile_stat & stat = g_ggml_cuda_mul_mat_profile_graph.by_key[key];
+    stat.calls++;
+    stat.total_ms += elapsed_ms;
+}
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    cudaEvent_t profile_start = nullptr;
+    cudaEvent_t profile_stop = nullptr;
+    const bool profile_op = g_ggml_cuda_op_profile_graph.active || g_ggml_cuda_mul_mat_profile_graph.active;
+    if (profile_op) {
+        CUDA_CHECK(cudaEventCreate(&profile_start));
+        CUDA_CHECK(cudaEventCreate(&profile_stop));
+        CUDA_CHECK(cudaEventRecord(profile_start, ctx.stream()));
+    }
+
+    bool supported = true;
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -2900,7 +3828,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     ggml_cuda_op_softplus(ctx, dst);
                     break;
                 default:
-                    return false;
+                    supported = false;
+                    break;
             }
             break;
         case GGML_OP_GLU:
@@ -2924,7 +3853,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     ggml_cuda_op_geglu_quick(ctx, dst);
                     break;
                 default:
-                    return false;
+                    supported = false;
+                    break;
             }
             break;
         case GGML_OP_NORM:
@@ -3069,6 +3999,20 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_argsort(ctx, dst);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
+#ifdef ED_ENABLE_CUDNN_SDPA
+        {
+            const ed_cudnn_sdpa_result_t cudnn_sdpa_result =
+                ed_cudnn_sdpa_compute(dst, (ed_cudnn_sdpa_stream_t) ctx.stream());
+            if (cudnn_sdpa_result == ED_CUDNN_SDPA_SUCCESS) {
+                break;
+            }
+            if (!ed_cudnn_sdpa_allows_fallback() &&
+                cudnn_sdpa_result != ED_CUDNN_SDPA_DISABLED) {
+                GGML_ABORT("cuDNN SDPA attention backend requested but failed: %s",
+                           ed_cudnn_sdpa_result_name(cudnn_sdpa_result));
+            }
+        }
+#endif
             ggml_cuda_flash_attn_ext(ctx, dst);
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
@@ -3105,13 +4049,33 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_fill(ctx, dst);
             break;
         default:
-            return false;
+            supported = false;
+            break;
+    }
+
+    if (!supported) {
+        if (profile_op) {
+            CUDA_CHECK(cudaEventDestroy(profile_start));
+            CUDA_CHECK(cudaEventDestroy(profile_stop));
+        }
+        return false;
     }
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         GGML_LOG_ERROR("%s: %s failed\n", __func__, ggml_op_desc(dst));
         CUDA_CHECK(err);
+    }
+
+    if (profile_op) {
+        CUDA_CHECK(cudaEventRecord(profile_stop, ctx.stream()));
+        CUDA_CHECK(cudaEventSynchronize(profile_stop));
+        float elapsed_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, profile_start, profile_stop));
+        ggml_cuda_op_profile_record(dst->op, elapsed_ms);
+        ggml_cuda_mul_mat_profile_record(dst, elapsed_ms);
+        CUDA_CHECK(cudaEventDestroy(profile_start));
+        CUDA_CHECK(cudaEventDestroy(profile_stop));
     }
 
     return true;
@@ -4455,10 +5419,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_op_profile_begin_graph(cgraph->n_nodes);
+    ggml_cuda_log_attention_neighborhood(cgraph);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
+    bool graph_enabled = false;
+    bool graph_compatible = false;
+    bool properties_changed = false;
+    bool warmup_complete = false;
+    bool graph_has_instance = false;
+    const char * graph_status_reason = "compiled_off";
 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
@@ -4466,10 +5438,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+    graph_enabled = graph->is_enabled();
+    warmup_complete = graph->warmup_complete;
+    graph_has_instance = graph->instance != nullptr;
+    graph_status_reason = graph_enabled ? "direct" : "disabled";
+    if (graph_enabled) {
+        graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        graph_status_reason = graph_compatible ? "direct" : "incompatible";
         if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -4478,6 +5455,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
+                    graph_status_reason = "warmup_capture";
+                } else {
+                    graph_status_reason = "warmup_properties_changed";
                 }
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
@@ -4486,14 +5466,34 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    graph_status_reason = "properties_changed";
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
+                    graph_status_reason = cuda_graph_update_required ? "capture_no_instance" : "replay";
                 }
             }
         }
     }
+    warmup_complete = graph->warmup_complete;
+    graph_has_instance = graph->instance != nullptr;
 #endif // USE_CUDA_GRAPH
+
+    ggml_cuda_log_graph_status(cgraph,
+                               graph_key,
+#ifdef USE_CUDA_GRAPH
+                               true,
+#else
+                               false,
+#endif
+                               graph_enabled,
+                               graph_compatible,
+                               properties_changed,
+                               warmup_complete,
+                               graph_has_instance,
+                               use_cuda_graph,
+                               cuda_graph_update_required,
+                               graph_status_reason);
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
@@ -4506,6 +5506,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    ggml_cuda_op_profile_end_graph(cuda_ctx->stream());
 
     return GGML_STATUS_SUCCESS;
 }

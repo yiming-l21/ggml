@@ -337,6 +337,30 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_F16  = 400,
 };
 
+static const char * ggml_cuda_fattn_kernel_name(best_fattn_kernel kernel) {
+    switch (kernel) {
+        case BEST_FATTN_KERNEL_NONE:
+            return "NONE";
+        case BEST_FATTN_KERNEL_TILE:
+            return "TILE";
+        case BEST_FATTN_KERNEL_VEC:
+            return "VEC";
+        case BEST_FATTN_KERNEL_WMMA_F16:
+            return "WMMA_F16";
+        case BEST_FATTN_KERNEL_MMA_F16:
+            return "MMA_F16";
+    }
+    return "UNKNOWN";
+}
+
+static bool ggml_cuda_fattn_profile_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("ED_PROFILE_CUDA_OPS");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -539,7 +563,30 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    if (ggml_cuda_fattn_profile_enabled()) {
+        const ggml_tensor * q    = dst->src[0];
+        const ggml_tensor * k    = dst->src[1];
+        const ggml_tensor * v    = dst->src[2];
+        const ggml_tensor * mask = dst->src[3];
+        GGML_LOG_INFO(
+            "ED_CUDA_FATTN kernel=%s q_type=%s k_type=%s v_type=%s dst_type=%s "
+            "q_ne=[%lld,%lld,%lld,%lld] "
+            "k_ne=[%lld,%lld,%lld,%lld] "
+            "v_ne=[%lld,%lld,%lld,%lld] "
+            "dst_ne=[%lld,%lld,%lld,%lld] mask=%d\n",
+            ggml_cuda_fattn_kernel_name(kernel),
+            ggml_type_name(q->type),
+            ggml_type_name(k->type),
+            ggml_type_name(v->type),
+            ggml_type_name(dst->type),
+            (long long) q->ne[0], (long long) q->ne[1], (long long) q->ne[2], (long long) q->ne[3],
+            (long long) k->ne[0], (long long) k->ne[1], (long long) k->ne[2], (long long) k->ne[3],
+            (long long) v->ne[0], (long long) v->ne[1], (long long) v->ne[2], (long long) v->ne[3],
+            (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+            mask != nullptr);
+    }
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:

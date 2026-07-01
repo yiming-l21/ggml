@@ -4006,8 +4006,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             if (cudnn_sdpa_result == ED_CUDNN_SDPA_SUCCESS) {
                 break;
             }
-            if (!ed_cudnn_sdpa_allows_fallback() &&
-                cudnn_sdpa_result != ED_CUDNN_SDPA_DISABLED) {
+            if (!ed_cudnn_sdpa_allows_fallback()) {
                 GGML_ABORT("cuDNN SDPA attention backend requested but failed: %s",
                            ed_cudnn_sdpa_result_name(cudnn_sdpa_result));
             }

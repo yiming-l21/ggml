@@ -361,6 +361,30 @@ static bool ggml_cuda_fattn_profile_enabled() {
     return enabled;
 }
 
+static best_fattn_kernel ggml_cuda_fattn_forced_kernel() {
+    static const best_fattn_kernel forced = [] {
+        const char * env = getenv("ED_FORCE_CUDA_FATTN_KERNEL");
+        if (env == nullptr || env[0] == '\0') {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        if (strcmp(env, "tile") == 0 || strcmp(env, "TILE") == 0) {
+            return BEST_FATTN_KERNEL_TILE;
+        }
+        if (strcmp(env, "vec") == 0 || strcmp(env, "VEC") == 0) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+        if (strcmp(env, "wmma") == 0 || strcmp(env, "WMMA") == 0 || strcmp(env, "wmma_f16") == 0 || strcmp(env, "WMMA_F16") == 0) {
+            return BEST_FATTN_KERNEL_WMMA_F16;
+        }
+        if (strcmp(env, "mma") == 0 || strcmp(env, "MMA") == 0 || strcmp(env, "mma_f16") == 0 || strcmp(env, "MMA_F16") == 0) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+        GGML_LOG_WARN("unknown ED_FORCE_CUDA_FATTN_KERNEL=%s, using default selector\n", env);
+        return BEST_FATTN_KERNEL_NONE;
+    }();
+    return forced;
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -564,6 +588,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    const best_fattn_kernel forced_kernel = ggml_cuda_fattn_forced_kernel();
+    if (forced_kernel != BEST_FATTN_KERNEL_NONE) {
+        kernel = forced_kernel;
+    }
     if (ggml_cuda_fattn_profile_enabled()) {
         const ggml_tensor * q    = dst->src[0];
         const ggml_tensor * k    = dst->src[1];

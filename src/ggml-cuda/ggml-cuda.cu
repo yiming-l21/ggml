@@ -2206,7 +2206,141 @@ typedef void (*ggml_cuda_op_mul_mat_t)(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
-    const int64_t src1_padded_row_size, cudaStream_t stream);
+    const int64_t src1_padded_row_size, const ggml_tensor * fused_bias, cudaStream_t stream);
+
+static bool ggml_cuda_mul_mat_bias_fusion_disabled() {
+    static const bool disabled = []() {
+        const char * env = std::getenv("ED_DISABLE_CUDA_MUL_MAT_BIAS_FUSION");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return disabled;
+}
+
+static const ggml_tensor * ggml_cuda_mul_mat_add_bias_tensor(
+        const ggml_tensor * dst,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1) {
+    if (dst == nullptr || dst->op != GGML_OP_ADD) {
+        return nullptr;
+    }
+
+    const ggml_tensor * mm_node = nullptr;
+    const ggml_tensor * bias    = nullptr;
+    if (dst->src[0] != nullptr && dst->src[0]->op == GGML_OP_MUL_MAT) {
+        mm_node = dst->src[0];
+        bias    = dst->src[1];
+    } else if (dst->src[1] != nullptr && dst->src[1]->op == GGML_OP_MUL_MAT) {
+        mm_node = dst->src[1];
+        bias    = dst->src[0];
+    }
+
+    if (mm_node == nullptr || bias == nullptr) {
+        return nullptr;
+    }
+    if (mm_node->src[0] != src0 || mm_node->src[1] != src1) {
+        return nullptr;
+    }
+    if (bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias)) {
+        return nullptr;
+    }
+
+    const bool row_bias = bias->ne[0] == dst->ne[0] && bias->ne[1] == 1 && bias->ne[2] == 1 && bias->ne[3] == 1;
+    const bool scalar_bias = ggml_nelements(bias) == 1;
+    if (!row_bias && !scalar_bias) {
+        return nullptr;
+    }
+
+    return bias;
+}
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __global__ void k_bf16_to_f32_add_row_bias(
+        const nv_bfloat16 * __restrict__ x,
+        const float       * __restrict__ bias,
+        float             * __restrict__ y,
+        const int64_t k,
+        const int64_t rows,
+        const bool scalar_bias) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t row = scalar_bias ? 0 : i % rows;
+    y[i] = __bfloat162float(x[i]) + bias[row];
+}
+
+static __global__ void k_bf16_to_f32_add_row_bias_vec2(
+        const nv_bfloat16 * __restrict__ x,
+        const float       * __restrict__ bias,
+        float             * __restrict__ y,
+        const int64_t k,
+        const int64_t rows,
+        const bool scalar_bias) {
+    const int64_t i2 = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int64_t n2 = k/2;
+
+    if (i2 < n2) {
+        const int64_t i = 2*i2;
+        const nv_bfloat162 xv = ((const nv_bfloat162 *) x)[i2];
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+        float2 yf = __bfloat1622float2(xv);
+#else
+        float2 yf = make_float2(__bfloat162float(xv.x), __bfloat162float(xv.y));
+#endif
+        if (scalar_bias) {
+            const float b = bias[0];
+            yf.x += b;
+            yf.y += b;
+        } else {
+            const int64_t row = i % rows;
+            const float2 bv = ((const float2 *) (bias + row))[0];
+            yf.x += bv.x;
+            yf.y += bv.y;
+        }
+        ((float2 *) y)[i2] = yf;
+    }
+
+    if ((k & 1) && i2 == n2) {
+        const int64_t row = scalar_bias ? 0 : (k - 1) % rows;
+        y[k - 1] = __bfloat162float(x[k - 1]) + bias[row];
+    }
+}
+#endif
+
+static void ggml_cuda_bf16_to_f32_add_row_bias(
+        const nv_bfloat16 * x,
+        const ggml_tensor * bias,
+        float * y,
+        const int64_t rows,
+        const int64_t cols,
+        cudaStream_t stream) {
+    const int64_t k = rows*cols;
+    if (k <= 0) {
+        return;
+    }
+
+    const bool scalar_bias = ggml_nelements(bias) == 1;
+    const float * bias_ptr = (const float *) bias->data;
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    constexpr int block_size = 256;
+    if (((uintptr_t) x % alignof(nv_bfloat162)) == 0 &&
+        ((uintptr_t) y % alignof(float2)) == 0 &&
+        (scalar_bias || (rows % 2 == 0 && ((uintptr_t) bias_ptr % alignof(float2)) == 0))) {
+        const int64_t n_threads = (k + 1)/2;
+        k_bf16_to_f32_add_row_bias_vec2<<<(n_threads + block_size - 1)/block_size, block_size, 0, stream>>>(
+            x, bias_ptr, y, k, rows, scalar_bias);
+        return;
+    }
+
+    k_bf16_to_f32_add_row_bias<<<(k + block_size - 1)/block_size, block_size, 0, stream>>>(
+        x, bias_ptr, y, k, rows, scalar_bias);
+#else
+    GGML_UNUSED_VARS(x, bias_ptr, y, rows, cols, stream, scalar_bias);
+    GGML_ABORT("BF16 matmul+bias fusion is not supported on this backend");
+#endif
+}
 
 #ifndef GGML_CUDA_PEER_MAX_BATCH_SIZE
 #define GGML_CUDA_PEER_MAX_BATCH_SIZE 128
@@ -2362,7 +2496,7 @@ static void ggml_cuda_op_mul_mat_cublas(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
-    const int64_t src1_padded_row_size, cudaStream_t stream) {
+    const int64_t src1_padded_row_size, const ggml_tensor * fused_bias, cudaStream_t stream) {
 
     GGML_ASSERT(src0_dd_i  != nullptr);
     GGML_ASSERT(src1_ddf_i != nullptr);
@@ -2425,12 +2559,18 @@ static void ggml_cuda_op_mul_mat_cublas(
         ggml_cuda_mul_mat_internal_profile_stop(
             profile_start, stream, "bf16", "gemm", src0, src1, dst, row_diff, src1_ncols, ne10);
 
-        const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
         profile_start = ggml_cuda_mul_mat_internal_profile_start(stream);
-        to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+        if (fused_bias != nullptr) {
+            ggml_cuda_bf16_to_f32_add_row_bias(dst_bf16.get(), fused_bias, dst_dd_i, row_diff, src1_ncols, stream);
+        } else {
+            const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+            to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+        }
         ggml_cuda_mul_mat_internal_profile_stop(
-            profile_start, stream, "bf16", "dst_to_f32", src0, src1, dst, row_diff, src1_ncols, ne10);
+            profile_start, stream, "bf16", fused_bias != nullptr ? "dst_to_f32_add_bias" : "dst_to_f32",
+            src0, src1, dst, row_diff, src1_ncols, ne10);
     } else if (fast_fp16_hardware_available(cc) && use_fp16) {
+        GGML_ASSERT(fused_bias == nullptr);
         // convert src0 and src1 to fp16, multiply as fp16, convert dst to fp32
         ggml_cuda_pool_alloc<half> src0_as_f16(ctx.pool(id));
         if (src0->type != GGML_TYPE_F16) {
@@ -2505,6 +2645,7 @@ static void ggml_cuda_op_mul_mat_cublas(
                 profile_start, stream, "fp16", "dst_to_f32", src0, src1, dst, row_diff, src1_ncols, ne10);
         }
     } else {
+        GGML_ASSERT(fused_bias == nullptr);
         ggml_cuda_pool_alloc<float> src0_ddq_as_f32(ctx.pool(id));
         ggml_cuda_pool_alloc<float> src1_ddq_as_f32(ctx.pool(id));
 
@@ -2571,7 +2712,7 @@ static cudaError_t ggml_cuda_Memcpy2DPeerAsync(
 static void ggml_cuda_op_mul_mat(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, ggml_cuda_op_mul_mat_t op,
-    quantize_cuda_t quantize_src1) {
+    quantize_cuda_t quantize_src1, const ggml_tensor * fused_bias = nullptr) {
 
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
@@ -2838,7 +2979,7 @@ static void ggml_cuda_op_mul_mat(
 
                 // do the computation
                 op(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i,
-                    dev[id].row_low, dev[id].row_high, src1_ncols, src1_padded_col_size, stream);
+                    dev[id].row_low, dev[id].row_high, src1_ncols, src1_padded_col_size, fused_bias, stream);
                 CUDA_CHECK(cudaGetLastError());
 
                 // copy dst to host or other device if necessary
@@ -3304,7 +3445,64 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
-static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+static bool ggml_cuda_should_fuse_mul_mat_bias_cublas(const ggml_tensor * mm_node, const ggml_tensor * bias_node) {
+    if (ggml_cuda_mul_mat_bias_fusion_disabled()) {
+        return false;
+    }
+
+    if (mm_node == nullptr || bias_node == nullptr || mm_node->op != GGML_OP_MUL_MAT || bias_node->op != GGML_OP_ADD) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = mm_node->src[0];
+    const ggml_tensor * src1 = mm_node->src[1];
+    const ggml_tensor * bias = ggml_cuda_mul_mat_add_bias_tensor(bias_node, src0, src1);
+    if (bias == nullptr) {
+        return false;
+    }
+
+    if (!ggml_are_same_shape(mm_node, bias_node) || bias_node->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (src0->type != GGML_TYPE_BF16 || src1->type != GGML_TYPE_F32 || mm_node->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || ggml_is_transposed(src0) || ggml_is_transposed(src1)) {
+        return false;
+    }
+
+    if (src0->ne[1] != mm_node->ne[0]) {
+        return false;
+    }
+
+    const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
+                       ggml_backend_buft_is_cuda_split(src1->buffer->buft);
+    if (split) {
+        return false;
+    }
+
+    if (src1->ne[2]*src1->ne[3] > 1) {
+        return false;
+    }
+
+    // Keep the normal ggml path choice: only fuse the large op_cublas BF16 GEMMs.
+    const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+
+    const bool use_mul_mat_f = src1->type == GGML_TYPE_F32 && mm_node->type == GGML_TYPE_F32 &&
+        ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
+    const bool use_mul_mat_vec_f = src1->type == GGML_TYPE_F32 && mm_node->type == GGML_TYPE_F32 &&
+        ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
+
+    return !use_mul_mat_f && !use_mul_mat_vec_f && bf16_mma_hardware_available(cc);
+}
+
+static void ggml_cuda_mul_mat(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const ggml_tensor * fused_bias = nullptr) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
@@ -3379,13 +3577,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         // general KQ + KQV multi-batch without FlashAttention
         ggml_cuda_mul_mat_batched_cublas(ctx, src0, src1, dst);
     } else if (use_mul_mat_vec_f) {
+        GGML_ASSERT(fused_bias == nullptr);
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_f, nullptr);
     } else if (use_mul_mat_vec_q) {
+        GGML_ASSERT(fused_bias == nullptr);
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_q, quantize_row_q8_1_cuda);
     } else if (use_mul_mat_q) {
+        GGML_ASSERT(fused_bias == nullptr);
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
     } else {
-        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
+        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr, fused_bias);
     }
 }
 
@@ -5117,22 +5318,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             continue;
         }
 
-        if (bias_op == GGML_OP_ADD && !ggml_are_same_shape(bias_node->src[0], bias_node->src[1])) {
-            continue;
-        }
+        const bool add_same_shape = bias_op != GGML_OP_ADD || ggml_are_same_shape(bias_node->src[0], bias_node->src[1]);
 
         ggml_cuda_mm_fusion_args_host fusion_data{};
         fusion_data.x_bias = bias_tensor;
 
-        if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
+        if (add_same_shape && ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
             ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
             break;
         }
 
-        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+        if (add_same_shape && ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+            fused_mul_mat_vec = true;
+            fused_node_count  = 2;
+            break;
+        }
+
+        if (bias_op == GGML_OP_ADD && ggml_cuda_should_fuse_mul_mat_bias_cublas(mm_node, bias_node)) {
+            ggml_cuda_mul_mat(*cuda_ctx, src0, src1, bias_node, bias_tensor);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
             break;

@@ -1,6 +1,7 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
 
+#include <cstdlib>
 #include <cstdint>
 
 #define CUDA_Q8_0_NE_ALIGN 2048
@@ -698,10 +699,92 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 
+static bool ggml_cuda_bf16_vec_convert_disabled() {
+    static const bool disabled = []() {
+        const char * env = std::getenv("ED_DISABLE_CUDA_BF16_VEC_CONVERT");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return disabled;
+}
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __global__ void convert_f32_to_bf16_vec2(const float * __restrict__ x, nv_bfloat16 * __restrict__ y, const int64_t k) {
+    const int64_t i2 = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    const int64_t n2 = k/2;
+
+    if (i2 < n2) {
+        const float2 v = ((const float2 *) x)[i2];
+        ((nv_bfloat162 *) y)[i2] = __float22bfloat162_rn(v);
+    }
+
+    if ((k & 1) && i2 == n2) {
+        y[k - 1] = __float2bfloat16(x[k - 1]);
+    }
+}
+
+static __global__ void convert_bf16_to_f32_vec2(const nv_bfloat16 * __restrict__ x, float * __restrict__ y, const int64_t k) {
+    const int64_t i2 = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    const int64_t n2 = k/2;
+
+    if (i2 < n2) {
+        const nv_bfloat162 v = ((const nv_bfloat162 *) x)[i2];
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+        ((float2 *) y)[i2] = __bfloat1622float2(v);
+#else
+        ((float2 *) y)[i2] = make_float2(__bfloat162float(v.x), __bfloat162float(v.y));
+#endif
+    }
+
+    if ((k & 1) && i2 == n2) {
+        y[k - 1] = __bfloat162float(x[k - 1]);
+    }
+}
+#endif
+
+static void convert_unary_cont_f32_to_bf16_vec_cuda(const void * vx, nv_bfloat16 * y, const int64_t k, cudaStream_t stream) {
+    if (k <= 0) {
+        return;
+    }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (!ggml_cuda_bf16_vec_convert_disabled() &&
+        ((uintptr_t) vx % alignof(float2)) == 0 &&
+        ((uintptr_t) y  % alignof(nv_bfloat162)) == 0) {
+        constexpr int block_size = 256;
+        const int64_t n_threads = (k + 1)/2;
+        convert_f32_to_bf16_vec2<<<(n_threads + block_size - 1)/block_size, block_size, 0, stream>>>(
+            (const float *) vx, y, k);
+        return;
+    }
+#endif
+
+    convert_unary_cont_cuda<float, nv_bfloat16>(vx, y, k, stream);
+}
+
+static void convert_unary_cont_bf16_to_f32_vec_cuda(const void * vx, float * y, const int64_t k, cudaStream_t stream) {
+    if (k <= 0) {
+        return;
+    }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (!ggml_cuda_bf16_vec_convert_disabled() &&
+        ((uintptr_t) vx % alignof(nv_bfloat162)) == 0 &&
+        ((uintptr_t) y  % alignof(float2)) == 0) {
+        constexpr int block_size = 256;
+        const int64_t n_threads = (k + 1)/2;
+        convert_bf16_to_f32_vec2<<<(n_threads + block_size - 1)/block_size, block_size, 0, stream>>>(
+            (const nv_bfloat16 *) vx, y, k);
+        return;
+    }
+#endif
+
+    convert_unary_cont_cuda<nv_bfloat16, float>(vx, y, k, stream);
+}
+
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
-            return convert_unary_cont_cuda<float>;
+            return convert_unary_cont_f32_to_bf16_vec_cuda;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         default:
@@ -816,7 +899,7 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:
-            return convert_unary_cont_cuda<nv_bfloat16>;
+            return convert_unary_cont_bf16_to_f32_vec_cuda;
         default:
             return nullptr;
     }

@@ -1,6 +1,7 @@
 #include "cpy.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
+#include <cstdlib>
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
@@ -185,10 +186,112 @@ static __global__ void cpy_scalar_contiguous(const char * cx, char * cdst, const
     dst[i] = ggml_cuda_cast<dst_t>(x[i]);
 }
 
+static bool ggml_cuda_cpy_vec_convert_disabled() {
+    static const bool disabled = []() {
+        const char * env = std::getenv("ED_DISABLE_CUDA_CPY_VEC_CONVERT");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return disabled;
+}
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+template<typename src_t, typename dst_t>
+static __device__ __forceinline__ void cpy_scalar_contiguous_vec2_convert(
+        const src_t * __restrict__ src,
+        dst_t * __restrict__ dst,
+        const int64_t i2) {
+    if constexpr (std::is_same_v<src_t, float> && std::is_same_v<dst_t, half>) {
+        const float2 v = ((const float2 *) src)[i2];
+        ((half2 *) dst)[i2] = __float22half2_rn(v);
+    } else if constexpr (std::is_same_v<src_t, half> && std::is_same_v<dst_t, float>) {
+        const half2 v = ((const half2 *) src)[i2];
+        ((float2 *) dst)[i2] = __half22float2(v);
+    } else if constexpr (std::is_same_v<src_t, float> && std::is_same_v<dst_t, nv_bfloat16>) {
+        const float2 v = ((const float2 *) src)[i2];
+        ((nv_bfloat162 *) dst)[i2] = ggml_cuda_cast<nv_bfloat162>(v);
+    } else if constexpr (std::is_same_v<src_t, nv_bfloat16> && std::is_same_v<dst_t, float>) {
+        const nv_bfloat162 v = ((const nv_bfloat162 *) src)[i2];
+        ((float2 *) dst)[i2] = ggml_cuda_cast<float2>(v);
+    } else if constexpr (std::is_same_v<src_t, half> && std::is_same_v<dst_t, nv_bfloat16>) {
+        const half2 v = ((const half2 *) src)[i2];
+        ((nv_bfloat162 *) dst)[i2] = ggml_cuda_cast<nv_bfloat162>(__half22float2(v));
+    } else if constexpr (std::is_same_v<src_t, nv_bfloat16> && std::is_same_v<dst_t, half>) {
+        const nv_bfloat162 v = ((const nv_bfloat162 *) src)[i2];
+        ((half2 *) dst)[i2] = __float22half2_rn(ggml_cuda_cast<float2>(v));
+    }
+}
+
+template<typename src_t, typename dst_t>
+static __global__ void cpy_scalar_contiguous_vec2(const char * cx, char * cdst, const int64_t ne) {
+    const int64_t i2 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+    const int64_t n2 = ne/2;
+
+    const src_t * x = (const src_t *) cx;
+    dst_t *     dst = (dst_t *) cdst;
+
+    if (i2 < n2) {
+        cpy_scalar_contiguous_vec2_convert<src_t, dst_t>(x, dst, i2);
+    }
+
+    if ((ne & 1) && i2 == n2) {
+        dst[ne - 1] = ggml_cuda_cast<dst_t>(x[ne - 1]);
+    }
+}
+
+template<typename src_t, typename dst_t>
+static constexpr bool cpy_scalar_contiguous_vec2_supported() {
+    return (std::is_same_v<src_t, float>       && std::is_same_v<dst_t, half>) ||
+           (std::is_same_v<src_t, half>        && std::is_same_v<dst_t, float>) ||
+           (std::is_same_v<src_t, float>       && std::is_same_v<dst_t, nv_bfloat16>) ||
+           (std::is_same_v<src_t, nv_bfloat16> && std::is_same_v<dst_t, float>) ||
+           (std::is_same_v<src_t, half>        && std::is_same_v<dst_t, nv_bfloat16>) ||
+           (std::is_same_v<src_t, nv_bfloat16> && std::is_same_v<dst_t, half>);
+}
+
+template<typename src_t, typename dst_t>
+static bool cpy_scalar_contiguous_vec2_aligned(const char * cx, const char * cdst) {
+    if constexpr (std::is_same_v<src_t, float>) {
+        if (((uintptr_t) cx % alignof(float2)) != 0) {
+            return false;
+        }
+    } else if constexpr (std::is_same_v<src_t, half>) {
+        if (((uintptr_t) cx % alignof(half2)) != 0) {
+            return false;
+        }
+    } else if constexpr (std::is_same_v<src_t, nv_bfloat16>) {
+        if (((uintptr_t) cx % alignof(nv_bfloat162)) != 0) {
+            return false;
+        }
+    }
+
+    if constexpr (std::is_same_v<dst_t, float>) {
+        return ((uintptr_t) cdst % alignof(float2)) == 0;
+    } else if constexpr (std::is_same_v<dst_t, half>) {
+        return ((uintptr_t) cdst % alignof(half2)) == 0;
+    } else if constexpr (std::is_same_v<dst_t, nv_bfloat16>) {
+        return ((uintptr_t) cdst % alignof(nv_bfloat162)) == 0;
+    }
+    return false;
+}
+#endif
+
 template<typename src_t, typename dst_t>
 static void ggml_cpy_scalar_contiguous_cuda(
     const char * cx, char * cdst, const int64_t ne,
 cudaStream_t stream) {
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (!ggml_cuda_cpy_vec_convert_disabled() &&
+        cpy_scalar_contiguous_vec2_supported<src_t, dst_t>() &&
+        cpy_scalar_contiguous_vec2_aligned<src_t, dst_t>(cx, cdst)) {
+        const int64_t n_threads = (ne + 1)/2;
+        const int64_t num_blocks = (n_threads + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+        GGML_ASSERT(num_blocks < UINT_MAX);
+        cpy_scalar_contiguous_vec2<src_t, dst_t><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
+            (cx, cdst, ne);
+        return;
+    }
+#endif
 
     const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
     GGML_ASSERT(num_blocks < UINT_MAX);

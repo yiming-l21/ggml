@@ -1,4 +1,7 @@
 #include "norm.cuh"
+#if defined(ED_ENABLE_CUDA_NORM)
+#include "ed_cuda_norm.h"
+#endif
 #include <cstdint>
 
 template <int block_size>
@@ -340,6 +343,30 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         return;
     }
     if (add == nullptr) {
+#if defined(ED_ENABLE_CUDA_NORM)
+        if (ed_cuda_rms_norm_mul_f32(x,
+                                     mul,
+                                     dst,
+                                     ncols,
+                                     nrows,
+                                     nchannels,
+                                     nsamples,
+                                     stride_row,
+                                     stride_channel,
+                                     stride_sample,
+                                     mul_stride_row,
+                                     mul_stride_channel,
+                                     mul_stride_sample,
+                                     mul_ncols,
+                                     mul_nrows,
+                                     mul_nchannels,
+                                     mul_nsamples,
+                                     eps,
+                                     stream)) {
+            return;
+        }
+#endif
+
         const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
         const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
         const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);

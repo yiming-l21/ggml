@@ -316,6 +316,113 @@ static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor * 
     }
 }
 
+struct mul_add_operand_f32 {
+    const float * data;
+    int64_t       s0;
+    int64_t       s1;
+    int64_t       s2;
+    int64_t       s3;
+    uint3         ne0;
+    uint3         ne1;
+    uint3         ne2;
+    uint3         ne3;
+};
+
+static mul_add_operand_f32 make_mul_add_operand_f32(const ggml_tensor * t) {
+    GGML_ASSERT(t->type == GGML_TYPE_F32);
+    GGML_ASSERT(t->nb[0] % sizeof(float) == 0);
+    GGML_ASSERT(t->nb[1] % sizeof(float) == 0);
+    GGML_ASSERT(t->nb[2] % sizeof(float) == 0);
+    GGML_ASSERT(t->nb[3] % sizeof(float) == 0);
+
+    return {
+        (const float *) t->data,
+        (int64_t) (t->nb[0] / sizeof(float)),
+        (int64_t) (t->nb[1] / sizeof(float)),
+        (int64_t) (t->nb[2] / sizeof(float)),
+        (int64_t) (t->nb[3] / sizeof(float)),
+        init_fastdiv_values((uint64_t) t->ne[0]),
+        init_fastdiv_values((uint64_t) t->ne[1]),
+        init_fastdiv_values((uint64_t) t->ne[2]),
+        init_fastdiv_values((uint64_t) t->ne[3]),
+    };
+}
+
+static __device__ __forceinline__ float read_mul_add_operand_f32(
+        const mul_add_operand_f32 & op,
+        const uint32_t i0,
+        const uint32_t i1,
+        const uint32_t i2,
+        const uint32_t i3) {
+    const uint32_t j0 = fastmodulo(i0, op.ne0);
+    const uint32_t j1 = fastmodulo(i1, op.ne1);
+    const uint32_t j2 = fastmodulo(i2, op.ne2);
+    const uint32_t j3 = fastmodulo(i3, op.ne3);
+    return op.data[j0*op.s0 + j1*op.s1 + j2*op.s2 + j3*op.s3];
+}
+
+static __global__ void k_mul_add_f32(
+        mul_add_operand_f32 x,
+        mul_add_operand_f32 y,
+        mul_add_operand_f32 z,
+        float * __restrict__ dst,
+        const uint32_t total,
+        const uint3 ne0,
+        const uint3 prod_01,
+        const uint3 prod_012) {
+    const uint32_t i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= total) {
+        return;
+    }
+
+    const uint32_t i3 = fastdiv(i, prod_012);
+    const uint32_t r3 = i - i3*prod_012.z;
+    const uint32_t i2 = fastdiv(r3, prod_01);
+    const uint32_t r2 = r3 - i2*prod_01.z;
+    const uint32_t i1 = fastdiv(r2, ne0);
+    const uint32_t i0 = r2 - i1*ne0.z;
+
+    const float xv = read_mul_add_operand_f32(x, i0, i1, i2, i3);
+    const float yv = read_mul_add_operand_f32(y, i0, i1, i2, i3);
+    const float zv = read_mul_add_operand_f32(z, i0, i1, i2, i3);
+    dst[i] = __fadd_rn(__fmul_rn(xv, yv), zv);
+}
+
+void ggml_cuda_op_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add) {
+    GGML_ASSERT(mul->op == GGML_OP_MUL);
+    GGML_ASSERT(add->op == GGML_OP_ADD);
+    GGML_ASSERT(add->src[0] == mul || add->src[1] == mul);
+    GGML_ASSERT(mul->type == GGML_TYPE_F32);
+    GGML_ASSERT(add->type == GGML_TYPE_F32);
+    GGML_ASSERT(mul->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(mul->src[1]->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(add));
+
+    const ggml_tensor * x = mul->src[0];
+    const ggml_tensor * y = mul->src[1];
+    const ggml_tensor * z = add->src[0] == mul ? add->src[1] : add->src[0];
+    GGML_ASSERT(z->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_can_repeat(x, add));
+    GGML_ASSERT(ggml_can_repeat(y, add));
+    GGML_ASSERT(ggml_can_repeat(z, add));
+
+    const int64_t total64 = ggml_nelements(add);
+    GGML_ASSERT(total64 <= (int64_t)std::numeric_limits<uint32_t>::max());
+
+    const mul_add_operand_f32 x_op = make_mul_add_operand_f32(x);
+    const mul_add_operand_f32 y_op = make_mul_add_operand_f32(y);
+    const mul_add_operand_f32 z_op = make_mul_add_operand_f32(z);
+
+    const uint3 ne0      = init_fastdiv_values((uint64_t) add->ne[0]);
+    const uint3 prod_01  = init_fastdiv_values((uint64_t) (add->ne[0]*add->ne[1]));
+    const uint3 prod_012 = init_fastdiv_values((uint64_t) (add->ne[0]*add->ne[1]*add->ne[2]));
+
+    constexpr int block_size = 256;
+    const uint32_t total = (uint32_t) total64;
+    k_mul_add_f32<<<(total + block_size - 1)/block_size, block_size, 0, ctx.stream()>>>(
+        x_op, y_op, z_op, (float *) add->data, total, ne0, prod_01, prod_012);
+}
+
 template <typename T>
 static __global__ void k_repeat_back(
     const T * __restrict__ src, T * __restrict__ dst, const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,

@@ -4763,6 +4763,52 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
     return is_ok;
 }
 
+static bool ggml_cuda_mul_add_fusion_disabled() {
+    static const bool disabled = []() {
+        const char * env = std::getenv("ED_DISABLE_CUDA_MUL_ADD_FUSION");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return disabled;
+}
+
+static bool ggml_cuda_should_fuse_mul_add(const ggml_tensor * mul, const ggml_tensor * add) {
+    if (ggml_cuda_mul_add_fusion_disabled()) {
+        return false;
+    }
+
+    if (mul == nullptr || add == nullptr || mul->op != GGML_OP_MUL || add->op != GGML_OP_ADD) {
+        return false;
+    }
+    if (add->src[0] != mul && add->src[1] != mul) {
+        return false;
+    }
+    if (!ggml_are_same_shape(mul, add)) {
+        return false;
+    }
+
+    const ggml_tensor * x = mul->src[0];
+    const ggml_tensor * y = mul->src[1];
+    const ggml_tensor * z = add->src[0] == mul ? add->src[1] : add->src[0];
+    if (x == nullptr || y == nullptr || z == nullptr) {
+        return false;
+    }
+    if (x->type != GGML_TYPE_F32 || y->type != GGML_TYPE_F32 || z->type != GGML_TYPE_F32 ||
+        mul->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_can_repeat(x, add) || !ggml_can_repeat(y, add) || !ggml_can_repeat(z, add)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(add)) {
+        return false;
+    }
+    if (ggml_nelements(add) > (int64_t)std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+
+    return true;
+}
+
 
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
@@ -5114,6 +5160,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (types_ok && shape_ok && dim_ok && x_in_add == x) {
             ggml_cuda_op_snake_fused(*cuda_ctx, x, a, inv_b, add);
             return 4;
+        }
+    }
+
+    if (ggml_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_ADD })) {
+        ggml_tensor * mul = cgraph->nodes[i];
+        ggml_tensor * add = cgraph->nodes[i + 1];
+        int out_node = i + 1;
+
+        if (ggml_cuda_should_fuse_mul_add(mul, add) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, &out_node, 1)) {
+            ggml_cuda_op_mul_add(*cuda_ctx, mul, add);
+            return 1;
         }
     }
 

@@ -65,6 +65,9 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml.h"
 
+#ifdef ED_ENABLE_CUDNN_CONV2D
+#include "ed_cudnn_conv2d.h"
+#endif
 #ifdef ED_ENABLE_CUDNN_SDPA
 #include "ed_cudnn_sdpa.h"
 #endif
@@ -4178,6 +4181,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_im2col_3d(ctx, dst);
             break;
         case GGML_OP_CONV_2D:
+#ifdef ED_ENABLE_CUDNN_CONV2D
+        {
+            const ed_cudnn_conv2d_result_t cudnn_conv2d_result =
+                ed_cudnn_conv2d_compute(dst, (ed_cudnn_conv2d_stream_t) ctx.stream());
+            if (cudnn_conv2d_result == ED_CUDNN_CONV2D_SUCCESS) {
+                break;
+            }
+        }
+#endif
             ggml_cuda_op_conv2d(ctx, dst);
             break;
         case GGML_OP_CONV_2D_DW:

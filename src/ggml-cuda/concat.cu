@@ -1,4 +1,13 @@
 #include "concat.cuh"
+#include <cstdlib>
+
+static bool ggml_cuda_concat_vec4_disabled() {
+    static const bool disabled = []() {
+        const char * env = std::getenv("ED_DISABLE_CUDA_CONCAT_VEC4");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return disabled;
+}
 
 // contiguous kernels
 template <int dim>
@@ -49,6 +58,66 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_f32_cont
     }
 }
 
+template <int dim>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_f32_cont_vec4(const float4 * x,
+                                                                                      const float4 * y,
+                                                                                      float4 *       dst,
+                                                                                      int64_t        ne00,
+                                                                                      int64_t        ne01,
+                                                                                      int64_t        ne02,
+                                                                                      int64_t        ne0,
+                                                                                      int64_t        ne1,
+                                                                                      int64_t        ne2) {
+    static_assert(dim >= 0 && dim <= 2, "dim must be in [0, 2]");
+
+    const int64_t ne0_v = ne0 / 4;
+    const int64_t n_v   = ne0_v * ne1 * ne2;
+
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n_v; i += (int64_t) blockDim.x * gridDim.x) {
+        if constexpr (dim == 0) {
+            const int64_t row = i / ne0_v;
+            const int64_t i0v = i - row * ne0_v;
+            const int64_t ne00_v = ne00 / 4;
+
+            if (i0v < ne00_v) {
+                dst[i] = x[row * ne00_v + i0v];
+            } else {
+                dst[i] = y[row * (ne0_v - ne00_v) + (i0v - ne00_v)];
+            }
+        } else if constexpr (dim == 1) {
+            const int64_t dst_plane_v  = ne0_v * ne1;
+            const int64_t src0_plane_v = ne0_v * ne01;
+            const int64_t src1_plane_v = dst_plane_v - src0_plane_v;
+            const int64_t i2           = i / dst_plane_v;
+            const int64_t i01v         = i - i2 * dst_plane_v;
+
+            if (i01v < src0_plane_v) {
+                dst[i] = x[i2 * src0_plane_v + i01v];
+            } else {
+                dst[i] = y[i2 * src1_plane_v + (i01v - src0_plane_v)];
+            }
+        } else {
+            const int64_t src0_size_v = ne0_v * ne1 * ne02;
+
+            if (i < src0_size_v) {
+                dst[i] = x[i];
+            } else {
+                dst[i] = y[i - src0_size_v];
+            }
+        }
+    }
+}
+
+static bool concat_f32_vec4_aligned(const float * x, const float * y, const float * dst) {
+    return ((uintptr_t) x   % alignof(float4)) == 0 &&
+           ((uintptr_t) y   % alignof(float4)) == 0 &&
+           ((uintptr_t) dst % alignof(float4)) == 0;
+}
+
+static bool concat_f32_vec4_supported(int64_t ne00, int64_t ne0) {
+    return (ne00 % 4) == 0 && (ne0 % 4) == 0;
+}
+
 static void concat_f32_cuda(const float * x,
                             const float * y,
                             float *       dst,
@@ -62,6 +131,26 @@ static void concat_f32_cuda(const float * x,
                             cudaStream_t  stream) {
     const int64_t n          = ne0 * ne1 * ne2;
     const int     num_blocks = (n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+
+    if (!ggml_cuda_concat_vec4_disabled() &&
+        concat_f32_vec4_supported(ne00, ne0) &&
+        concat_f32_vec4_aligned(x, y, dst)) {
+        const int64_t n_v          = n / 4;
+        const int     num_blocks_v = (n_v + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+        if (dim == 0) {
+            concat_f32_cont_vec4<0><<<num_blocks_v, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+                (const float4 *) x, (const float4 *) y, (float4 *) dst, ne00, ne01, ne02, ne0, ne1, ne2);
+            return;
+        }
+        if (dim == 1) {
+            concat_f32_cont_vec4<1><<<num_blocks_v, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+                (const float4 *) x, (const float4 *) y, (float4 *) dst, ne00, ne01, ne02, ne0, ne1, ne2);
+            return;
+        }
+        concat_f32_cont_vec4<2><<<num_blocks_v, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+            (const float4 *) x, (const float4 *) y, (float4 *) dst, ne00, ne01, ne02, ne0, ne1, ne2);
+        return;
+    }
 
     if (dim == 0) {
         concat_f32_cont<0>

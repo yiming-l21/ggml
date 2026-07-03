@@ -1,5 +1,14 @@
 #include "unary.cuh"
 #include "convert.cuh"
+#include <cstdlib>
+
+static bool ggml_cuda_unary_row_strided_disabled() {
+    static const bool disabled = []() {
+        const char * env = std::getenv("ED_DISABLE_CUDA_UNARY_ROW_STRIDED");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return disabled;
+}
 
 static __device__ __forceinline__ float op_abs(float x) {
     return fabsf(x);
@@ -152,13 +161,71 @@ static __global__ void unary_op_strided_kernel(const char * x,
 }
 
 template <float (*op)(float), typename T>
+static __global__ void unary_op_row_strided_kernel(const char * x,
+                                                   T * dst,
+                                                   const int64_t ne0,
+                                                   const int64_t ne1,
+                                                   const int64_t ne2,
+                                                   const int64_t nb1,
+                                                   const int64_t nb2,
+                                                   const int64_t nb3) {
+    const int64_t i0  = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+    const int64_t i1  = blockIdx.y;
+    const int64_t i23 = blockIdx.z;
+
+    if (i0 >= ne0) {
+        return;
+    }
+
+    const int64_t i2 = i23 % ne2;
+    const int64_t i3 = i23 / ne2;
+
+    const T * xp = (const T *) (x + i3*nb3 + i2*nb2 + i1*nb1);
+    dst[(i23*ne1 + i1)*ne0 + i0] = (T)op((float)xp[i0]);
+}
+
+template <float (*op)(float), typename T>
 static void unary_cuda(const T * x, T * dst, const int k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
     unary_op_kernel<op><<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(x, dst, k);
 }
 
+static bool unary_row_strided_cuda_supported(const ggml_tensor * src0) {
+    if (ggml_cuda_unary_row_strided_disabled()) {
+        return false;
+    }
+
+    constexpr int64_t max_grid_x  = 2147483647;
+    constexpr int64_t max_grid_yz = 65535;
+
+    const int64_t grid_x = (src0->ne[0] + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    const int64_t grid_y = src0->ne[1];
+    const int64_t grid_z = src0->ne[2] * src0->ne[3];
+
+    return grid_x > 0 && grid_x <= max_grid_x &&
+           grid_y > 0 && grid_y <= max_grid_yz &&
+           grid_z > 0 && grid_z <= max_grid_yz;
+}
+
 template <float (*op)(float), typename T>
 static void unary_strided_cuda(const void * x, T * dst, const ggml_tensor * src0, cudaStream_t stream) {
+    if (unary_row_strided_cuda_supported(src0)) {
+        const dim3 num_blocks(
+            (unsigned int) ((src0->ne[0] + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE),
+            (unsigned int) src0->ne[1],
+            (unsigned int) (src0->ne[2] * src0->ne[3]));
+        unary_op_row_strided_kernel<op><<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(
+            (const char *) x,
+            dst,
+            src0->ne[0],
+            src0->ne[1],
+            src0->ne[2],
+            src0->nb[1],
+            src0->nb[2],
+            src0->nb[3]);
+        return;
+    }
+
     const int64_t k = ggml_nelements(src0);
     const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
     unary_op_strided_kernel<op><<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(

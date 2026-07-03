@@ -69,7 +69,9 @@
 #include "ed_cudnn_sdpa.h"
 #endif
 #ifdef ED_ENABLE_CUDA_ROPE
+#include "ed_cuda_attention_v_prep.h"
 #include "ed_cuda_rope.h"
+#include "backend/ggml/ed_ggml_attention_ext.hpp"
 #include "backend/ggml/ed_ggml_rope_ext.hpp"
 #endif
 
@@ -4160,6 +4162,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             if (ed_cuda_rope_custom_compute(dst, (ed_cuda_rope_stream_t) ctx.stream())) {
                 break;
             }
+            if (ed_cuda_attention_v_prep_custom_compute(dst, (ed_cuda_attention_v_prep_stream_t) ctx.stream())) {
+                break;
+            }
 #endif
             GGML_ABORT("unsupported CUDA custom op");
             break;
@@ -6597,6 +6602,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                                                                    static_cast<edgedit::ggml_ext::RopeInputLayout>(rope_params.input_layout),
                                                                    rope_params.interleaved != 0,
                                                                    rope_params.d_head)) {
+                    return true;
+                }
+                const edgedit::ggml_ext::AttentionVPrepCustomParams v_prep_params =
+                    edgedit::ggml_ext::attention_v_prep_params_from_userdata(custom_params.userdata);
+                if (edgedit::ggml_ext::attention_v_prep_params_valid(v_prep_params) &&
+                    op->src[0] != nullptr &&
+                    edgedit::ggml_ext::attention_v_prep_shape_supported(op->src[0],
+                                                                        v_prep_params.v_is_seq_major != 0)) {
                     return true;
                 }
             }

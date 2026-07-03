@@ -4159,10 +4159,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_CUSTOM:
 #ifdef ED_ENABLE_CUDA_ROPE
-            if (ed_cuda_rope_custom_compute(dst, (ed_cuda_rope_stream_t) ctx.stream())) {
-                break;
-            }
-            if (ed_cuda_attention_v_prep_custom_compute(dst, (ed_cuda_attention_v_prep_stream_t) ctx.stream())) {
+            if (ed_cuda_attention_qkv_pair_pack_custom_compute(dst, (ed_cuda_attention_v_prep_stream_t) ctx.stream()) ||
+                ed_cuda_attention_pair_pack_custom_compute(dst, (ed_cuda_attention_v_prep_stream_t) ctx.stream()) ||
+                ed_cuda_attention_v_prep_custom_compute(dst, (ed_cuda_attention_v_prep_stream_t) ctx.stream()) ||
+                ed_cuda_rope_custom_compute(dst, (ed_cuda_rope_stream_t) ctx.stream())) {
                 break;
             }
 #endif
@@ -6584,35 +6584,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             break;
         case GGML_OP_CUSTOM:
 #ifdef ED_ENABLE_CUDA_ROPE
-            {
-                struct ggml_custom_op_params {
-                    ggml_custom_op_t fun;
-                    int n_tasks;
-                    void* userdata;
-                };
-                ggml_custom_op_params custom_params{};
-                memcpy(&custom_params, op->op_params, sizeof(custom_params));
-                const edgedit::ggml_ext::RopeCustomParams rope_params =
-                    edgedit::ggml_ext::rope_params_from_userdata(custom_params.userdata);
-                if (edgedit::ggml_ext::rope_params_valid(rope_params) &&
-                    op->src[0] != nullptr &&
-                    op->src[1] != nullptr &&
-                    edgedit::ggml_ext::rope_custom_shape_supported(op->src[0],
-                                                                   op->src[1],
-                                                                   static_cast<edgedit::ggml_ext::RopeInputLayout>(rope_params.input_layout),
-                                                                   rope_params.interleaved != 0,
-                                                                   rope_params.d_head)) {
-                    return true;
-                }
-                const edgedit::ggml_ext::AttentionVPrepCustomParams v_prep_params =
-                    edgedit::ggml_ext::attention_v_prep_params_from_userdata(custom_params.userdata);
-                if (edgedit::ggml_ext::attention_v_prep_params_valid(v_prep_params) &&
-                    op->src[0] != nullptr &&
-                    edgedit::ggml_ext::attention_v_prep_shape_supported(op->src[0],
-                                                                        v_prep_params.v_is_seq_major != 0)) {
-                    return true;
-                }
-            }
+            return ed_cuda_attention_qkv_pair_pack_custom_supported(op) ||
+                   ed_cuda_attention_pair_pack_custom_supported(op) ||
+                   ed_cuda_attention_v_prep_custom_supported(op) ||
+                   ed_cuda_rope_custom_supported(op);
 #endif
             return false;
         case GGML_OP_NONE:

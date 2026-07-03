@@ -68,6 +68,9 @@
 #ifdef ED_ENABLE_CUDNN_CONV2D
 #include "ed_cudnn_conv2d.h"
 #endif
+#ifdef ED_ENABLE_CUDNN_CONV3D
+#include "ed_cudnn_conv3d.h"
+#endif
 #ifdef ED_ENABLE_CUDNN_SDPA
 #include "ed_cudnn_sdpa.h"
 #endif
@@ -131,6 +134,14 @@ static const char * ggml_cuda_op_profile_category(enum ggml_op op) {
             return "GEMM";
         case GGML_OP_FLASH_ATTN_EXT:
             return "FLASH_ATTN";
+        case GGML_OP_IM2COL:
+        case GGML_OP_IM2COL_3D:
+        case GGML_OP_CONV_2D:
+        case GGML_OP_CONV_3D:
+        case GGML_OP_CONV_2D_DW:
+        case GGML_OP_CONV_TRANSPOSE_2D:
+        case GGML_OP_CONV_TRANSPOSE_1D:
+            return "CONV";
         case GGML_OP_DUP:
         case GGML_OP_CPY:
         case GGML_OP_CONT:
@@ -4192,6 +4203,18 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
 #endif
             ggml_cuda_op_conv2d(ctx, dst);
             break;
+        case GGML_OP_CONV_3D:
+#ifdef ED_ENABLE_CUDNN_CONV3D
+        {
+            const ed_cudnn_conv3d_result_t cudnn_conv3d_result =
+                ed_cudnn_conv3d_compute(dst, (ed_cudnn_conv3d_stream_t) ctx.stream());
+            if (cudnn_conv3d_result == ED_CUDNN_CONV3D_SUCCESS) {
+                break;
+            }
+        }
+#endif
+            GGML_ABORT("unsupported CUDA op CONV_3D");
+            break;
         case GGML_OP_CONV_2D_DW:
             ggml_cuda_op_conv2d_dw(ctx, dst);
             break;
@@ -6666,6 +6689,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CONV_TRANSPOSE_2D:
         case GGML_OP_POOL_2D:
             return true;
+        case GGML_OP_CONV_3D:
+#ifdef ED_ENABLE_CUDNN_CONV3D
+            return ed_cudnn_conv3d_supported(op, dev_ctx->device);
+#else
+            return false;
+#endif
         case GGML_OP_ACC:
             // TODO: extend support like so:
             //return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]);

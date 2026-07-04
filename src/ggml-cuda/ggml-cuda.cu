@@ -80,6 +80,9 @@
 #include "backend/ggml/ed_ggml_attention_ext.hpp"
 #include "backend/ggml/ed_ggml_rope_ext.hpp"
 #endif
+#ifdef ED_ENABLE_CUDA_MODULATION
+#include "ed_cuda_modulation.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -4172,6 +4175,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_rope_back(ctx, dst);
             break;
         case GGML_OP_CUSTOM:
+#ifdef ED_ENABLE_CUDA_MODULATION
+            if (ed_cuda_fused_modulate_custom_compute(dst, (ed_cuda_modulation_stream_t) ctx.stream())) {
+                break;
+            }
+#endif
 #ifdef ED_ENABLE_CUDA_ROPE
             if (ed_cuda_attention_qkv_pair_pack_custom_compute(dst, (ed_cuda_attention_v_prep_stream_t) ctx.stream()) ||
                 ed_cuda_attention_pair_pack_custom_compute(dst, (ed_cuda_attention_v_prep_stream_t) ctx.stream()) ||
@@ -6618,6 +6626,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_is_contiguous(op->src[0]);
             break;
         case GGML_OP_CUSTOM:
+#ifdef ED_ENABLE_CUDA_MODULATION
+            if (ed_cuda_fused_modulate_custom_supported(op)) {
+                return true;
+            }
+#endif
 #ifdef ED_ENABLE_CUDA_ROPE
             return ed_cuda_attention_qkv_pair_pack_custom_supported(op) ||
                    ed_cuda_attention_pair_pack_custom_supported(op) ||

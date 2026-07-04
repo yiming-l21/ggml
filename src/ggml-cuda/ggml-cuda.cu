@@ -2239,6 +2239,27 @@ static bool ggml_cuda_mul_mat_bias_fusion_disabled() {
     return disabled;
 }
 
+static int32_t ggml_cuda_mul_mat_effective_prec(const ggml_tensor * dst) {
+    if (dst != nullptr && dst->op == GGML_OP_UNARY && dst->src[0] != nullptr && dst->src[0]->op == GGML_OP_ADD) {
+        const ggml_tensor * add_node = dst->src[0];
+        if (add_node->src[0] != nullptr && add_node->src[0]->op == GGML_OP_MUL_MAT) {
+            return add_node->src[0]->op_params[0];
+        }
+        if (add_node->src[1] != nullptr && add_node->src[1]->op == GGML_OP_MUL_MAT) {
+            return add_node->src[1]->op_params[0];
+        }
+    }
+    return dst != nullptr ? dst->op_params[0] : GGML_PREC_DEFAULT;
+}
+
+static bool ggml_cuda_mul_mat_fused_gelu(const ggml_tensor * dst) {
+    return dst != nullptr &&
+           dst->op == GGML_OP_UNARY &&
+           ggml_get_unary_op(dst) == GGML_UNARY_OP_GELU &&
+           dst->src[0] != nullptr &&
+           dst->src[0]->op == GGML_OP_ADD;
+}
+
 static const ggml_tensor * ggml_cuda_mul_mat_add_bias_tensor(
         const ggml_tensor * dst,
         const ggml_tensor * src0,
@@ -2277,6 +2298,116 @@ static const ggml_tensor * ggml_cuda_mul_mat_add_bias_tensor(
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __global__ void k_f16_to_f32_add_row_bias(
+        const half  * __restrict__ x,
+        const float * __restrict__ bias,
+        float       * __restrict__ y,
+        const int64_t k,
+        const int64_t rows,
+        const bool scalar_bias) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t row = scalar_bias ? 0 : i % rows;
+    y[i] = __half2float(x[i]) + bias[row];
+}
+
+template<bool gelu>
+static __global__ void k_f16_to_f32_add_row_bias_act(
+        const half  * __restrict__ x,
+        const float * __restrict__ bias,
+        float       * __restrict__ y,
+        const int64_t k,
+        const int64_t rows,
+        const bool scalar_bias) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t row = scalar_bias ? 0 : i % rows;
+    float v = __half2float(x[i]) + bias[row];
+    if constexpr (gelu) {
+        v = ggml_cuda_op_gelu_single(v);
+    }
+    y[i] = v;
+}
+
+static __global__ void k_f16_to_f32_add_row_bias_vec2(
+        const half  * __restrict__ x,
+        const float * __restrict__ bias,
+        float       * __restrict__ y,
+        const int64_t k,
+        const int64_t rows,
+        const bool scalar_bias) {
+    const int64_t i2 = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int64_t n2 = k/2;
+
+    if (i2 < n2) {
+        const int64_t i = 2*i2;
+        float2 yf = __half22float2(((const half2 *) x)[i2]);
+        if (scalar_bias) {
+            const float b = bias[0];
+            yf.x += b;
+            yf.y += b;
+        } else {
+            const int64_t row = i % rows;
+            const float2 bv = ((const float2 *) (bias + row))[0];
+            yf.x += bv.x;
+            yf.y += bv.y;
+        }
+        ((float2 *) y)[i2] = yf;
+    }
+
+    if ((k & 1) && i2 == n2) {
+        const int64_t row = scalar_bias ? 0 : (k - 1) % rows;
+        y[k - 1] = __half2float(x[k - 1]) + bias[row];
+    }
+}
+
+template<bool gelu>
+static __global__ void k_f16_to_f32_add_row_bias_act_vec2(
+        const half  * __restrict__ x,
+        const float * __restrict__ bias,
+        float       * __restrict__ y,
+        const int64_t k,
+        const int64_t rows,
+        const bool scalar_bias) {
+    const int64_t i2 = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int64_t n2 = k/2;
+
+    if (i2 < n2) {
+        const int64_t i = 2*i2;
+        float2 yf = __half22float2(((const half2 *) x)[i2]);
+        if (scalar_bias) {
+            const float b = bias[0];
+            yf.x += b;
+            yf.y += b;
+        } else {
+            const int64_t row = i % rows;
+            const float2 bv = ((const float2 *) (bias + row))[0];
+            yf.x += bv.x;
+            yf.y += bv.y;
+        }
+        if constexpr (gelu) {
+            yf.x = ggml_cuda_op_gelu_single(yf.x);
+            yf.y = ggml_cuda_op_gelu_single(yf.y);
+        }
+        ((float2 *) y)[i2] = yf;
+    }
+
+    if ((k & 1) && i2 == n2) {
+        const int64_t row = scalar_bias ? 0 : (k - 1) % rows;
+        float v = __half2float(x[k - 1]) + bias[row];
+        if constexpr (gelu) {
+            v = ggml_cuda_op_gelu_single(v);
+        }
+        y[k - 1] = v;
+    }
+}
+
 static __global__ void k_bf16_to_f32_add_row_bias(
         const nv_bfloat16 * __restrict__ x,
         const float       * __restrict__ bias,
@@ -2291,6 +2422,27 @@ static __global__ void k_bf16_to_f32_add_row_bias(
 
     const int64_t row = scalar_bias ? 0 : i % rows;
     y[i] = __bfloat162float(x[i]) + bias[row];
+}
+
+template<bool gelu>
+static __global__ void k_bf16_to_f32_add_row_bias_act(
+        const nv_bfloat16 * __restrict__ x,
+        const float       * __restrict__ bias,
+        float             * __restrict__ y,
+        const int64_t k,
+        const int64_t rows,
+        const bool scalar_bias) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t row = scalar_bias ? 0 : i % rows;
+    float v = __bfloat162float(x[i]) + bias[row];
+    if constexpr (gelu) {
+        v = ggml_cuda_op_gelu_single(v);
+    }
+    y[i] = v;
 }
 
 static __global__ void k_bf16_to_f32_add_row_bias_vec2(
@@ -2329,7 +2481,121 @@ static __global__ void k_bf16_to_f32_add_row_bias_vec2(
         y[k - 1] = __bfloat162float(x[k - 1]) + bias[row];
     }
 }
+
+template<bool gelu>
+static __global__ void k_bf16_to_f32_add_row_bias_act_vec2(
+        const nv_bfloat16 * __restrict__ x,
+        const float       * __restrict__ bias,
+        float             * __restrict__ y,
+        const int64_t k,
+        const int64_t rows,
+        const bool scalar_bias) {
+    const int64_t i2 = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int64_t n2 = k/2;
+
+    if (i2 < n2) {
+        const int64_t i = 2*i2;
+        const nv_bfloat162 xv = ((const nv_bfloat162 *) x)[i2];
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+        float2 yf = __bfloat1622float2(xv);
+#else
+        float2 yf = make_float2(__bfloat162float(xv.x), __bfloat162float(xv.y));
 #endif
+        if (scalar_bias) {
+            const float b = bias[0];
+            yf.x += b;
+            yf.y += b;
+        } else {
+            const int64_t row = i % rows;
+            const float2 bv = ((const float2 *) (bias + row))[0];
+            yf.x += bv.x;
+            yf.y += bv.y;
+        }
+        if constexpr (gelu) {
+            yf.x = ggml_cuda_op_gelu_single(yf.x);
+            yf.y = ggml_cuda_op_gelu_single(yf.y);
+        }
+        ((float2 *) y)[i2] = yf;
+    }
+
+    if ((k & 1) && i2 == n2) {
+        const int64_t row = scalar_bias ? 0 : (k - 1) % rows;
+        float v = __bfloat162float(x[k - 1]) + bias[row];
+        if constexpr (gelu) {
+            v = ggml_cuda_op_gelu_single(v);
+        }
+        y[k - 1] = v;
+    }
+}
+#endif
+
+static void ggml_cuda_f16_to_f32_add_row_bias(
+        const half * x,
+        const ggml_tensor * bias,
+        float * y,
+        const int64_t rows,
+        const int64_t cols,
+        cudaStream_t stream) {
+    const int64_t k = rows*cols;
+    if (k <= 0) {
+        return;
+    }
+
+    const bool scalar_bias = ggml_nelements(bias) == 1;
+    const float * bias_ptr = (const float *) bias->data;
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    constexpr int block_size = 256;
+    if (((uintptr_t) x % alignof(half2)) == 0 &&
+        ((uintptr_t) y % alignof(float2)) == 0 &&
+        (scalar_bias || (rows % 2 == 0 && ((uintptr_t) bias_ptr % alignof(float2)) == 0))) {
+        const int64_t n_threads = (k + 1)/2;
+        k_f16_to_f32_add_row_bias_vec2<<<(n_threads + block_size - 1)/block_size, block_size, 0, stream>>>(
+            x, bias_ptr, y, k, rows, scalar_bias);
+        return;
+    }
+
+    k_f16_to_f32_add_row_bias<<<(k + block_size - 1)/block_size, block_size, 0, stream>>>(
+        x, bias_ptr, y, k, rows, scalar_bias);
+#else
+    GGML_UNUSED_VARS(x, bias_ptr, y, rows, cols, stream, scalar_bias);
+    GGML_ABORT("F16 matmul+bias fusion is not supported on this backend");
+#endif
+}
+
+static void ggml_cuda_f16_to_f32_add_row_bias_gelu(
+        const half * x,
+        const ggml_tensor * bias,
+        float * y,
+        const int64_t rows,
+        const int64_t cols,
+        cudaStream_t stream) {
+    const int64_t k = rows*cols;
+    if (k <= 0) {
+        return;
+    }
+
+    const bool scalar_bias = ggml_nelements(bias) == 1;
+    const float * bias_ptr = (const float *) bias->data;
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    constexpr int block_size = 256;
+    if (((uintptr_t) x % alignof(half2)) == 0 &&
+        ((uintptr_t) y % alignof(float2)) == 0 &&
+        (scalar_bias || (rows % 2 == 0 && ((uintptr_t) bias_ptr % alignof(float2)) == 0))) {
+        const int64_t n_threads = (k + 1)/2;
+        k_f16_to_f32_add_row_bias_act_vec2<true><<<(n_threads + block_size - 1)/block_size, block_size, 0, stream>>>(
+            x, bias_ptr, y, k, rows, scalar_bias);
+        return;
+    }
+
+    k_f16_to_f32_add_row_bias_act<true><<<(k + block_size - 1)/block_size, block_size, 0, stream>>>(
+        x, bias_ptr, y, k, rows, scalar_bias);
+#else
+    GGML_UNUSED_VARS(x, bias_ptr, y, rows, cols, stream, scalar_bias);
+    GGML_ABORT("F16 matmul+bias+GELU fusion is not supported on this backend");
+#endif
+}
 
 static void ggml_cuda_bf16_to_f32_add_row_bias(
         const nv_bfloat16 * x,
@@ -2362,6 +2628,40 @@ static void ggml_cuda_bf16_to_f32_add_row_bias(
 #else
     GGML_UNUSED_VARS(x, bias_ptr, y, rows, cols, stream, scalar_bias);
     GGML_ABORT("BF16 matmul+bias fusion is not supported on this backend");
+#endif
+}
+
+static void ggml_cuda_bf16_to_f32_add_row_bias_gelu(
+        const nv_bfloat16 * x,
+        const ggml_tensor * bias,
+        float * y,
+        const int64_t rows,
+        const int64_t cols,
+        cudaStream_t stream) {
+    const int64_t k = rows*cols;
+    if (k <= 0) {
+        return;
+    }
+
+    const bool scalar_bias = ggml_nelements(bias) == 1;
+    const float * bias_ptr = (const float *) bias->data;
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    constexpr int block_size = 256;
+    if (((uintptr_t) x % alignof(nv_bfloat162)) == 0 &&
+        ((uintptr_t) y % alignof(float2)) == 0 &&
+        (scalar_bias || (rows % 2 == 0 && ((uintptr_t) bias_ptr % alignof(float2)) == 0))) {
+        const int64_t n_threads = (k + 1)/2;
+        k_bf16_to_f32_add_row_bias_act_vec2<true><<<(n_threads + block_size - 1)/block_size, block_size, 0, stream>>>(
+            x, bias_ptr, y, k, rows, scalar_bias);
+        return;
+    }
+
+    k_bf16_to_f32_add_row_bias_act<true><<<(k + block_size - 1)/block_size, block_size, 0, stream>>>(
+        x, bias_ptr, y, k, rows, scalar_bias);
+#else
+    GGML_UNUSED_VARS(x, bias_ptr, y, rows, cols, stream, scalar_bias);
+    GGML_ABORT("BF16 matmul+bias+GELU fusion is not supported on this backend");
 #endif
 }
 
@@ -2543,12 +2843,15 @@ static void ggml_cuda_op_mul_mat_cublas(
     const bool supports_bf16 = GGML_CUDA_CC_IS_NVIDIA(cc) || GGML_CUDA_CC_IS_AMD(cc) ||
         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_QY2);
 
+    const int32_t effective_prec = ggml_cuda_mul_mat_effective_prec(dst);
+    const bool fused_gelu = ggml_cuda_mul_mat_fused_gelu(dst);
+
     const bool use_fp16 =
         src0->type != GGML_TYPE_NVFP4 &&
         (src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) &&
         ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1] &&
-        dst->op_params[0] == GGML_PREC_DEFAULT;
+        effective_prec == GGML_PREC_DEFAULT;
 
     if (supports_bf16 && src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
         ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id));
@@ -2583,17 +2886,18 @@ static void ggml_cuda_op_mul_mat_cublas(
             profile_start, stream, "bf16", "gemm", src0, src1, dst, row_diff, src1_ncols, ne10);
 
         profile_start = ggml_cuda_mul_mat_internal_profile_start(stream);
-        if (fused_bias != nullptr) {
+        if (fused_bias != nullptr && fused_gelu) {
+            ggml_cuda_bf16_to_f32_add_row_bias_gelu(dst_bf16.get(), fused_bias, dst_dd_i, row_diff, src1_ncols, stream);
+        } else if (fused_bias != nullptr) {
             ggml_cuda_bf16_to_f32_add_row_bias(dst_bf16.get(), fused_bias, dst_dd_i, row_diff, src1_ncols, stream);
         } else {
             const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
             to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff*src1_ncols, stream);
         }
         ggml_cuda_mul_mat_internal_profile_stop(
-            profile_start, stream, "bf16", fused_bias != nullptr ? "dst_to_f32_add_bias" : "dst_to_f32",
+            profile_start, stream, "bf16", fused_bias != nullptr ? (fused_gelu ? "dst_to_f32_add_bias_gelu" : "dst_to_f32_add_bias") : "dst_to_f32",
             src0, src1, dst, row_diff, src1_ncols, ne10);
     } else if (fast_fp16_hardware_available(cc) && use_fp16) {
-        GGML_ASSERT(fused_bias == nullptr);
         // convert src0 and src1 to fp16, multiply as fp16, convert dst to fp32
         ggml_cuda_pool_alloc<half> src0_as_f16(ctx.pool(id));
         if (src0->type != GGML_TYPE_F16) {
@@ -2630,6 +2934,7 @@ static void ggml_cuda_op_mul_mat_cublas(
                                         || cc == GGML_CUDA_CC_VOLTA
                                         || force_compute_type.fp32))
         {
+            GGML_ASSERT(fused_bias == nullptr);
             const float alpha = 1.0f;
             const float beta = 0.0f;
             cudaEvent_t profile_start = ggml_cuda_mul_mat_internal_profile_start(stream);
@@ -2661,11 +2966,18 @@ static void ggml_cuda_op_mul_mat_cublas(
             ggml_cuda_mul_mat_internal_profile_stop(
                 profile_start, stream, "fp16", "gemm_f16_dst", src0, src1, dst, row_diff, src1_ncols, ne10);
 
-            const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
             profile_start = ggml_cuda_mul_mat_internal_profile_start(stream);
-            to_fp32_cuda(dst_f16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+            if (fused_bias != nullptr && fused_gelu) {
+                ggml_cuda_f16_to_f32_add_row_bias_gelu(dst_f16.get(), fused_bias, dst_dd_i, row_diff, src1_ncols, stream);
+            } else if (fused_bias != nullptr) {
+                ggml_cuda_f16_to_f32_add_row_bias(dst_f16.get(), fused_bias, dst_dd_i, row_diff, src1_ncols, stream);
+            } else {
+                const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+                to_fp32_cuda(dst_f16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+            }
             ggml_cuda_mul_mat_internal_profile_stop(
-                profile_start, stream, "fp16", "dst_to_f32", src0, src1, dst, row_diff, src1_ncols, ne10);
+                profile_start, stream, "fp16", fused_bias != nullptr ? (fused_gelu ? "dst_to_f32_add_bias_gelu" : "dst_to_f32_add_bias") : "dst_to_f32",
+                src0, src1, dst, row_diff, src1_ncols, ne10);
         }
     } else {
         GGML_ASSERT(fused_bias == nullptr);
@@ -3488,7 +3800,8 @@ static bool ggml_cuda_should_fuse_mul_mat_bias_cublas(const ggml_tensor * mm_nod
         return false;
     }
 
-    if (src0->type != GGML_TYPE_BF16 || src1->type != GGML_TYPE_F32 || mm_node->type != GGML_TYPE_F32) {
+    if ((src0->type != GGML_TYPE_BF16 && src0->type != GGML_TYPE_F16) ||
+        src1->type != GGML_TYPE_F32 || mm_node->type != GGML_TYPE_F32) {
         return false;
     }
 
@@ -3510,7 +3823,7 @@ static bool ggml_cuda_should_fuse_mul_mat_bias_cublas(const ggml_tensor * mm_nod
         return false;
     }
 
-    // Keep the normal ggml path choice: only fuse the large op_cublas BF16 GEMMs.
+    // Keep the normal ggml path choice: only fuse the large op_cublas GEMMs.
     const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
 
@@ -3519,7 +3832,42 @@ static bool ggml_cuda_should_fuse_mul_mat_bias_cublas(const ggml_tensor * mm_nod
     const bool use_mul_mat_vec_f = src1->type == GGML_TYPE_F32 && mm_node->type == GGML_TYPE_F32 &&
         ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
 
-    return !use_mul_mat_f && !use_mul_mat_vec_f && bf16_mma_hardware_available(cc);
+    if (use_mul_mat_f || use_mul_mat_vec_f) {
+        return false;
+    }
+
+    if (src0->type == GGML_TYPE_BF16) {
+        return bf16_mma_hardware_available(cc);
+    }
+
+    const auto & force_compute_type = ggml_cuda_cublas_get_force_compute_type();
+    const bool fp16_uses_f32_dst = !force_compute_type.fp16 && (GGML_CUDA_CC_IS_CDNA(cc)
+                                                            || GGML_CUDA_CC_IS_RDNA4(cc)
+                                                            || cc == GGML_CUDA_CC_VOLTA
+                                                            || force_compute_type.fp32);
+    return fast_fp16_hardware_available(cc) && mm_node->op_params[0] == GGML_PREC_DEFAULT && !fp16_uses_f32_dst;
+}
+
+static bool ggml_cuda_should_fuse_mul_mat_bias_gelu_cublas(
+        const ggml_tensor * mm_node,
+        const ggml_tensor * bias_node,
+        const ggml_tensor * gelu_node) {
+    if (!ggml_cuda_should_fuse_mul_mat_bias_cublas(mm_node, bias_node)) {
+        return false;
+    }
+    if (gelu_node == nullptr ||
+        gelu_node->op != GGML_OP_UNARY ||
+        ggml_get_unary_op(gelu_node) != GGML_UNARY_OP_GELU ||
+        gelu_node->src[0] != bias_node) {
+        return false;
+    }
+    if (!ggml_are_same_shape(bias_node, gelu_node) ||
+        bias_node->type != GGML_TYPE_F32 ||
+        gelu_node->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    return true;
 }
 
 static void ggml_cuda_mul_mat(
@@ -4889,6 +5237,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
     std::initializer_list<enum ggml_op> mul_mat_id_glu_ops = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
     std::initializer_list<enum ggml_op> mul_mat_glu_ops    = { GGML_OP_MUL_MAT,    GGML_OP_MUL_MAT,    GGML_OP_GLU };
+    std::initializer_list<enum ggml_op> mul_mat_bias_gelu_ops = { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY };
 
     if ((is_equal(mul_mat_bias_glu_ops, ops) || is_equal(mul_mat_id_bias_glu_ops, ops)) &&
         ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 4 })) {
@@ -4916,6 +5265,22 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    if (is_equal(mul_mat_bias_gelu_ops, ops) &&
+        unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_GELU &&
+        ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
+        const ggml_tensor * mm_node   = cgraph->nodes[node_idx];
+        const ggml_tensor * bias_node = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * gelu_node = cgraph->nodes[node_idx + 2];
+
+        if (ggml_get_unary_op(gelu_node) != GGML_UNARY_OP_GELU ||
+            !ggml_cuda_should_fuse_mul_mat_bias_gelu_cublas(mm_node, bias_node, gelu_node)) {
+            return false;
+        }
+
+        int out_nodes[] = { node_idx + 2 };
+        return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+    }
+
     std::initializer_list<enum ggml_op> rope_set_rows_ops = { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
     if (is_equal(rope_set_rows_ops, ops) && ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
@@ -4932,8 +5297,10 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return false;
     }
 
-    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
-        const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
+    if ((ops.size() == 2 || ops.size() == 3) &&
+        (ops.begin()[0] == GGML_OP_RMS_NORM || ops.begin()[0] == GGML_OP_NORM) &&
+        ops.begin()[1] == GGML_OP_MUL) {
+        const ggml_tensor *norm = cgraph->nodes[node_idx];
         const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
         const ggml_tensor *add      = nullptr;
 
@@ -4941,10 +5308,10 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             add = cgraph->nodes[node_idx+2];
         }
 
-        GGML_ASSERT(rms_norm->src[0]->type == GGML_TYPE_F32);
-        GGML_ASSERT(rms_norm->type == GGML_TYPE_F32);
+        GGML_ASSERT(norm->src[0]->type == GGML_TYPE_F32);
+        GGML_ASSERT(norm->type == GGML_TYPE_F32);
 
-        //rms norm only supports F32
+        // norm fusion only supports F32
         if (mul->src[0]->type != GGML_TYPE_F32 ||
             mul->src[1]->type != GGML_TYPE_F32 ||
             mul->type != GGML_TYPE_F32) {
@@ -4957,12 +5324,12 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             return false;
         }
 
-        //if rms norm is the B operand, then we don't handle broadcast
-        if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm)) {
+        // If norm is the B operand, then we don't handle broadcast.
+        if (norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], norm)) {
             return false;
         }
 
-        //rms_norm kernel assumes contiguous rows
+        // Norm kernels assume contiguous rows.
         if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1])) {
             return false;
         }
@@ -5405,6 +5772,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
+        if (bias_op == GGML_OP_ADD &&
+            ggml_cuda_can_fuse(cgraph, i, { op, bias_op, GGML_OP_UNARY }, { GGML_UNARY_OP_GELU })) {
+            ggml_tensor * mm_node   = cgraph->nodes[i];
+            ggml_tensor * bias_node = cgraph->nodes[i + 1];
+            ggml_tensor * gelu_node = cgraph->nodes[i + 2];
+
+            ggml_tensor * bias_tensor = nullptr;
+            if (bias_node->src[0] == mm_node) {
+                bias_tensor = bias_node->src[1];
+            } else if (bias_node->src[1] == mm_node) {
+                bias_tensor = bias_node->src[0];
+            } else {
+                continue;
+            }
+
+            const ggml_tensor * src0 = mm_node->src[0];
+            const ggml_tensor * src1 = mm_node->src[1];
+
+            if (ggml_cuda_should_fuse_mul_mat_bias_gelu_cublas(mm_node, bias_node, gelu_node)) {
+                ggml_cuda_mul_mat(*cuda_ctx, src0, src1, gelu_node, bias_tensor);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+        }
+
         if (!ggml_can_fuse(cgraph, i, { op, bias_op })) {
             continue;
         }
@@ -5465,6 +5858,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
+        ggml_cuda_op_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL }, {})) {
+        ggml_cuda_op_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {

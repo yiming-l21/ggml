@@ -83,6 +83,9 @@
 #ifdef ED_ENABLE_CUDA_MODULATION
 #include "ed_cuda_modulation.h"
 #endif
+#ifdef ED_ENABLE_CUDA_NORM
+#include "ed_cuda_norm.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -4523,6 +4526,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_rope_back(ctx, dst);
             break;
         case GGML_OP_CUSTOM:
+#ifdef ED_ENABLE_CUDA_NORM
+            if (ed_cuda_channel_rms_norm_custom_compute(dst, (ed_cuda_norm_stream_t) ctx.stream())) {
+                break;
+            }
+#endif
 #ifdef ED_ENABLE_CUDA_MODULATION
             if (ed_cuda_fused_modulate_custom_compute(dst, (ed_cuda_modulation_stream_t) ctx.stream())) {
                 break;
@@ -7029,6 +7037,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_is_contiguous(op->src[0]);
             break;
         case GGML_OP_CUSTOM:
+#ifdef ED_ENABLE_CUDA_NORM
+            if (ed_cuda_channel_rms_norm_custom_supported(op)) {
+                return true;
+            }
+#endif
 #ifdef ED_ENABLE_CUDA_MODULATION
             if (ed_cuda_fused_modulate_custom_supported(op)) {
                 return true;

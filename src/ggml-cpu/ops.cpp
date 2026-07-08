@@ -6759,7 +6759,7 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
                                               ggml_type                   kernel_type) {
 
     GGML_ASSERT(ggml_is_contiguous(kernel));
-    GGML_ASSERT(kernel_type == GGML_TYPE_F16 || kernel_type == GGML_TYPE_F32);
+    GGML_ASSERT(kernel_type == GGML_TYPE_F16 || kernel_type == GGML_TYPE_F32 || kernel_type == GGML_TYPE_BF16);
     GGML_ASSERT(kernel->type == kernel_type);
 
     const ggml_type_traits * traits = ggml_get_type_traits(kernel_type);
@@ -6839,6 +6839,8 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
                             *(float *) element_ptr = src_val;
                         } else if (kernel_type == GGML_TYPE_F16) {
                             *(ggml_fp16_t *) element_ptr = GGML_CPU_FP32_TO_FP16(src_val);
+                        } else if (kernel_type == GGML_TYPE_BF16) {
+                            *(ggml_bf16_t *) element_ptr = GGML_FP32_TO_BF16(src_val);
                         }
                     }
                 }

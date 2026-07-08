@@ -1359,28 +1359,37 @@ UseGgmlGemm1:;
     ggml_barrier(params->threadpool);
 
 #if GGML_USE_ONEDNN
-    // edge-dit: bf16 weights x bf16 activations (already converted into wdata) ->
-    // route large matmuls through oneDNN (Intel AMX bf16). ith==0 enters; oneDNN
-    // parallelizes internally while other workers wait on the barrier below.
+    // edge-dit: bf16 weights x bf16 activations -> route large matmuls through
+    // oneDNN (Intel AMX bf16). ith==0 enters; oneDNN parallelizes internally while
+    // other workers wait on the barrier below. Activations are bf16 either because
+    // ggml converted f32->bf16 into wdata (src1->type != vec_dot_type), or because
+    // src1 is already bf16 (e.g. the conv im2col GEMM) — handle both.
     if (src0->type == GGML_TYPE_BF16 && vec_dot_type == GGML_TYPE_BF16 &&
-        src1->type != vec_dot_type &&  // activations were converted into wdata
+        (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16) &&
         !getenv("ED_ONEDNN_OFF") &&
-        ggml_is_contiguous(src0) &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
         ne01 >= 32 && ne11 >= 32 && ne00 >= 32) {
         if (ith == 0) {
             const int64_t r2 = ne12 / ne02;
             const int64_t r3 = ne13 / ne03;
-            const void* wdata = params->wdata;
+            const bool src1_is_bf16 = (src1->type == vec_dot_type);
+            // bf16 activation source: src1->data if already bf16, else wdata (converted).
+            const void* act_base = src1_is_bf16 ? (const void*)src1->data : (const void*)params->wdata;
             const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+            const size_t act_ld   = src1_is_bf16 ? (nb11 / sizeof(ggml_bf16_t))
+                                                  : (row_size / sizeof(ggml_bf16_t));
             bool ok = true;
             for (int64_t i13 = 0; i13 < ne13 && ok; i13++) {
                 for (int64_t i12 = 0; i12 < ne12 && ok; i12++) {
+                    const void* act = src1_is_bf16
+                        ? (const void*)((const char*)act_base + i12*nb12 + i13*nb13)
+                        : (const void*)((const char*)act_base + (i12*ne11 + i13*ne12*ne11)*row_size);
                     ok = ed_onednn_sgemm_bf16(
                         ne01, ne11, ne00,
                         (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
                         nb01 / sizeof(ggml_bf16_t),
-                        (const char *)wdata + (i12*ne11 + i13*ne12*ne11)*row_size,
-                        row_size / sizeof(ggml_bf16_t),
+                        act,
+                        act_ld,
                         (char *)dst->data + i12*nb2 + i13*nb3,
                         nb1 / sizeof(float));
                 }

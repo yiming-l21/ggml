@@ -127,22 +127,28 @@ stream& get_stream() {
     return s;
 }
 
-// Cache keyed by weight pointer. Holds the packed weights, the primitive_desc,
-// the JIT'd primitive, and REUSED src/dst memory objects. Constructing a fresh
-// dnnl::memory per call for these shapes cost ~8ms (5ms->13ms) and was the real
-// bottleneck; we build them once and only swap the data handle on the hot path.
+// Two-level cache. The packed weight layout depends only on (weight ptr, n, k) —
+// NOT on m (the activation/token count). m varies constantly (per token count, per
+// conv patch tile), so keying the weight reorder on m re-packed the same weight on
+// every shape change (~1.3s/step of wasted reorders). WeightPack caches the packed
+// bf16 weights across all m; Entry caches the m-specific primitive + memory objects.
+struct WeightPack {
+    int64_t n = 0, k = 0;
+    memory b_packed;
+    bool valid = false;
+};
 struct Entry {
     int64_t m = 0, n = 0, k = 0;
     matmul::primitive_desc pd;
     matmul prim;
-    memory b_packed;
     memory a_mem;   // src, data handle swapped per call
     memory c_mem;   // dst, data handle swapped per call
     bool valid = false;
 };
 struct Cache {
     std::mutex mtx;
-    std::unordered_map<const void*, Entry> map;
+    std::unordered_map<const void*, WeightPack> wpack;  // weight ptr -> packed weights
+    std::unordered_map<const void*, Entry>      map;    // weight ptr -> m-specific primitive
 };
 Cache& cache() { static Cache c; return c; }
 
@@ -164,8 +170,11 @@ extern "C" bool ed_onednn_sgemm_bf16(int64_t n, int64_t m, int64_t k,
 
         auto& c = cache();
         Entry* e = nullptr;
+        memory* b_packed = nullptr;
         {
             std::lock_guard<std::mutex> lk(c.mtx);
+
+            // Level 2 first: m-specific primitive + src/dst memory objects.
             auto it = c.map.find(src0_bf16);
             if (it != c.map.end() && it->second.valid &&
                 it->second.m == m && it->second.n == n && it->second.k == k) {
@@ -182,14 +191,6 @@ extern "C" bool ed_onednn_sgemm_bf16(int64_t n, int64_t m, int64_t k,
                 ent.pd = matmul::primitive_desc(eng, a_md, b_any, c_md);
                 ent.prim = matmul(ent.pd);
 
-                // src0 stored [n,k] row-major (stride lda); view as Bt[k,n] {1,lda},
-                // reorder ONCE into the packed layout the primitive wants.
-                memory::desc b_user({k, n}, dt::bf16, memory::dims{1, lda_elems});
-                memory b_user_mem(b_user, eng, const_cast<void*>(src0_bf16));
-                ent.b_packed = memory(ent.pd.weights_desc(), eng);
-                reorder(b_user_mem, ent.b_packed).execute(s, b_user_mem, ent.b_packed);
-                s.wait();
-
                 // Build src/dst memory objects ONCE; the hot path only swaps handles.
                 ent.a_mem = memory(ent.pd.src_desc(), eng, const_cast<void*>(act_bf16));
                 ent.c_mem = memory(ent.pd.dst_desc(), eng, dst_f32);
@@ -198,6 +199,27 @@ extern "C" bool ed_onednn_sgemm_bf16(int64_t n, int64_t m, int64_t k,
                 auto res = c.map.insert_or_assign(src0_bf16, std::move(ent));
                 e = &res.first->second;
             }
+
+            // Level 1: packed weights, independent of m. Reorder ONCE per (ptr,n,k),
+            // reusing the packed layout the primitive wants. m varies constantly
+            // (token counts, conv patch tiles); keying the reorder on m re-packed the
+            // same weight every shape change (~1.3s/step wasted). Pack keyed on (ptr,n,k).
+            auto wit = c.wpack.find(src0_bf16);
+            if (wit != c.wpack.end() && wit->second.valid &&
+                wit->second.n == n && wit->second.k == k) {
+                b_packed = &wit->second.b_packed;
+            } else {
+                memory::desc b_user({k, n}, dt::bf16, memory::dims{1, lda_elems});
+                memory b_user_mem(b_user, eng, const_cast<void*>(src0_bf16));
+                WeightPack wp;
+                wp.n = n; wp.k = k;
+                wp.b_packed = memory(e->pd.weights_desc(), eng);
+                reorder(b_user_mem, wp.b_packed).execute(s, b_user_mem, wp.b_packed);
+                s.wait();
+                wp.valid = true;
+                auto wres = c.wpack.insert_or_assign(src0_bf16, std::move(wp));
+                b_packed = &wres.first->second.b_packed;
+            }
         }
 
         // Hot path: reuse cached memory objects, only swap the data handles.
@@ -205,7 +227,7 @@ extern "C" bool ed_onednn_sgemm_bf16(int64_t n, int64_t m, int64_t k,
         e->c_mem.set_data_handle(dst_f32);
 
         e->prim.execute(s, {{DNNL_ARG_SRC, e->a_mem},
-                            {DNNL_ARG_WEIGHTS, e->b_packed},
+                            {DNNL_ARG_WEIGHTS, *b_packed},
                             {DNNL_ARG_DST, e->c_mem}});
         s.wait();
         return true;

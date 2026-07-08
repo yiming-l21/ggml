@@ -20,8 +20,12 @@
 
 static const size_t CACHE_LINE_SIZE_F32 = CACHE_LINE_SIZE/sizeof(float);
 
-// Work buffer size for im2col operations in CONV2D
-#define GGML_IM2COL_WORK_SIZE (16 * 1024 * 1024)
+// Work buffer size for im2col operations in CONV2D. Larger = more patches per
+// batch = fewer im2col/GEMM barrier round-trips. The direct-conv path splits
+// patch_total into ceil(patch_total / (WORK_SIZE/space_per_patch)) batches, each
+// bracketed by two ggml_barriers; at 16MiB a 512x512x512ch conv fell into ~176
+// tiny batches (barrier storm on 96 threads). 256MiB keeps it to a handful.
+#define GGML_IM2COL_WORK_SIZE (256 * 1024 * 1024)
 
 #ifdef __cplusplus
 extern "C" {

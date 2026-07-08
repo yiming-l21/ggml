@@ -235,3 +235,138 @@ extern "C" bool ed_onednn_sgemm_bf16(int64_t n, int64_t m, int64_t k,
         return false;
     }
 }
+
+namespace {
+// Conv primitive cache, keyed by weight pointer. Holds the primitive_desc (with
+// `any` formats so oneDNN picks AMX-optimal blocking), the JIT'd primitive, and the
+// packed weights (reordered once). src/dst are reordered per call when oneDNN's
+// preferred layout differs from ggml's plain nchw — cheap vs the conv itself, and
+// still far below the old im2col+GEMM materialization.
+struct ConvEntry {
+    int64_t N=0, IC=0, IH=0, IW=0, OC=0, KH=0, KW=0, OH=0, OW=0;
+    int64_t sh=0, sw=0, ph=0, pw=0, dh=0, dw=0;
+    convolution_forward::primitive_desc pd;
+    convolution_forward prim;
+    memory w_packed;   // weights, reordered + cached (data is stable per ptr)
+    // Cached src/dst reorder scaffolding so the hot path only swaps data handles
+    // (allocating scratch memory + building reorder primitives every call was pure
+    // per-call overhead). need_src/need_dst record whether a reorder is required.
+    bool   need_src = false, need_dst = false;
+    memory src_scratch, dst_scratch;   // blocked-layout buffers (allocated once)
+    memory src_user_mem, dst_user_mem; // plain-nchw views; data handle swapped per call
+    reorder src_reorder, dst_reorder;
+    bool valid = false;
+};
+struct ConvCache {
+    std::mutex mtx;
+    std::unordered_map<const void*, ConvEntry> map;
+};
+ConvCache& conv_cache() { static ConvCache c; return c; }
+}  // namespace
+
+extern "C" bool ed_onednn_conv2d_bf16(int64_t N, int64_t IC, int64_t IH, int64_t IW,
+                                      int64_t OC, int64_t KH, int64_t KW,
+                                      int64_t OH, int64_t OW,
+                                      int64_t sh, int64_t sw, int64_t ph, int64_t pw,
+                                      int64_t dh, int64_t dw,
+                                      const void* src_f32,
+                                      const void* wgt_bf16,
+                                      void* dst_f32) {
+    try {
+        using dt  = memory::data_type;
+        using tag = memory::format_tag;
+
+        engine& eng = get_engine();
+        stream& s   = get_stream();
+
+        auto& c = conv_cache();
+        ConvEntry* e = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(c.mtx);
+            auto it = c.map.find(wgt_bf16);
+            if (it != c.map.end() && it->second.valid &&
+                it->second.N==N && it->second.IC==IC && it->second.IH==IH && it->second.IW==IW &&
+                it->second.OC==OC && it->second.KH==KH && it->second.KW==KW &&
+                it->second.sh==sh && it->second.sw==sw && it->second.ph==ph && it->second.pw==pw &&
+                it->second.dh==dh && it->second.dw==dw) {
+                e = &it->second;
+            } else {
+                ConvEntry ent;
+                ent.N=N; ent.IC=IC; ent.IH=IH; ent.IW=IW; ent.OC=OC; ent.KH=KH; ent.KW=KW;
+                ent.OH=OH; ent.OW=OW; ent.sh=sh; ent.sw=sw; ent.ph=ph; ent.pw=pw; ent.dh=dh; ent.dw=dw;
+
+                // All `any`: oneDNN picks the AMX-optimal blocked layout for src,
+                // weights, and dst. Pinning src or dst to plain nchw forced a
+                // pathologically slow conv kernel (100x). The per-call src/dst
+                // reorders this incurs are the tax for ggml's plain-layout tensors;
+                // still a net win over the im2col+GEMM path.
+                memory::desc src_any({N, IC, IH, IW}, dt::bf16, tag::any);
+                memory::desc wgt_any({OC, IC, KH, KW}, dt::bf16, tag::any);
+                memory::desc dst_any({N, OC, OH, OW}, dt::f32,  tag::any);
+                // oneDNN dilation is 0-based (0 == no dilation), same as ggml's d-1.
+                ent.pd = convolution_forward::primitive_desc(
+                    eng, prop_kind::forward_inference, algorithm::convolution_direct,
+                    src_any, wgt_any, dst_any,
+                    memory::dims{sh, sw}, memory::dims{dh, dw},
+                    memory::dims{ph, pw}, memory::dims{ph, pw});
+                ent.prim = convolution_forward(ent.pd);
+
+                // ggml kernel is [KW,KH,IC,OC] contiguous == oihw dims {OC,IC,KH,KW}
+                // with plain strides. Reorder ONCE into the packed layout.
+                memory::desc w_user({OC, IC, KH, KW}, dt::bf16, tag::oihw);
+                memory w_user_mem(w_user, eng, const_cast<void*>(wgt_bf16));
+                ent.w_packed = memory(ent.pd.weights_desc(), eng);
+                reorder(w_user_mem, ent.w_packed).execute(s, w_user_mem, ent.w_packed);
+                s.wait();
+
+                // Build src/dst reorder scaffolding once. src is ggml f32 nchw
+                // {N,IC,IH,IW}; dst is ggml f32 nchw {N,OC,OH,OW}. If the primitive
+                // wants a different (blocked/bf16) layout, pre-build the scratch
+                // buffer + reorder primitive so the hot path only swaps data handles.
+                memory::desc src_plain({N, IC, IH, IW}, dt::f32, tag::nchw);
+                memory::desc dst_plain({N, OC, OH, OW}, dt::f32, tag::nchw);
+                ent.src_user_mem = memory(src_plain, eng, nullptr);
+                ent.dst_user_mem = memory(dst_plain, eng, nullptr);
+                ent.need_src = (ent.pd.src_desc() != src_plain);
+                ent.need_dst = (ent.pd.dst_desc() != dst_plain);
+                if (ent.need_src) {
+                    ent.src_scratch = memory(ent.pd.src_desc(), eng);
+                    ent.src_reorder = reorder(ent.src_user_mem, ent.src_scratch);
+                }
+                if (ent.need_dst) {
+                    ent.dst_scratch = memory(ent.pd.dst_desc(), eng);
+                    ent.dst_reorder = reorder(ent.dst_scratch, ent.dst_user_mem);
+                }
+
+                ent.valid = true;
+                auto res = c.map.insert_or_assign(wgt_bf16, std::move(ent));
+                e = &res.first->second;
+            }
+        }
+
+        // Hot path: swap data handles into the cached memory objects; run cached
+        // reorder primitives (built once above). src f32->bf16/blocked in, blocked
+        // conv, blocked->f32 nchw out.
+        e->src_user_mem.set_data_handle(const_cast<void*>(src_f32));
+        e->dst_user_mem.set_data_handle(dst_f32);
+
+        memory& src_mem = e->need_src ? e->src_scratch : e->src_user_mem;
+        memory& dst_mem = e->need_dst ? e->dst_scratch : e->dst_user_mem;
+
+        if (e->need_src) {
+            e->src_reorder.execute(s, e->src_user_mem, e->src_scratch);
+        }
+
+        e->prim.execute(s, {{DNNL_ARG_SRC, src_mem},
+                            {DNNL_ARG_WEIGHTS, e->w_packed},
+                            {DNNL_ARG_DST, dst_mem}});
+
+        if (e->need_dst) {
+            e->dst_reorder.execute(s, e->dst_scratch, e->dst_user_mem);
+        }
+        s.wait();
+        return true;
+    } catch (const dnnl::error&) {
+        return false;
+    }
+}

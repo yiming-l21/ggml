@@ -8,6 +8,10 @@
 #include "unary-ops.h"
 #include "vec.h"
 
+#if GGML_USE_ONEDNN
+#include "ggml-onednn.h"
+#endif
+
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -6785,6 +6789,28 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
     const float * src_data = (float *) src->data;
     void  * knl_data       = kernel->data;
     float * dst_data       = (float *) dst->data;
+
+#if GGML_USE_ONEDNN
+    // Route bf16 conv through oneDNN's native AMX conv (fuses im2col into the
+    // kernel — no giant im2col buffer). ith==0 enters; oneDNN parallelizes
+    // internally. Falls back to the im2col+GEMM path below on any failure.
+    if (kernel_type == GGML_TYPE_BF16 && !getenv("ED_ONEDNN_CONV_OFF") &&
+        ggml_is_contiguous(src) && ggml_is_contiguous(dst)) {
+        if (params->ith == 0) {
+            const bool ok = ed_onednn_conv2d_bf16(
+                     src->ne[3], c_in, src_h, src_w,
+                     c_out, knl_h, knl_w, dst_h, dst_w,
+                     stride_y, stride_x, pad_y, pad_x, dilation_y - 1, dilation_x - 1,
+                     src_data, knl_data, dst_data);
+            ggml_threadpool_chunk_set(params->threadpool, ok ? -1 : 0);
+        }
+        ggml_barrier(params->threadpool);
+        if (ggml_threadpool_chunk_add(params->threadpool, 0) == -1) {
+            return;  // oneDNN handled it
+        }
+        // oneDNN declined/failed: fall through to the ggml im2col+GEMM path.
+    }
+#endif
 
     const int64_t knl_n           = knl_w * knl_h * c_in;
     const int64_t patch_total     = dst->ne[3] * dst_w * dst_h;

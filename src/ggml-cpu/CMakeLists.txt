@@ -93,6 +93,17 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                     ggml-cpu/llamafile/sgemm.h)
     endif()
 
+    if (GGML_ONEDNN)
+        find_package(dnnl CONFIG REQUIRED)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_ONEDNN)
+
+        list(APPEND GGML_CPU_SOURCES
+                    ggml-cpu/ggml-onednn.cpp
+                    ggml-cpu/ggml-onednn.h)
+
+        target_link_libraries(${GGML_CPU_NAME} PRIVATE DNNL::dnnl)
+    endif()
+
     if (GGML_CPU_HBM)
         find_library(memkind memkind REQUIRED)
 

@@ -2044,6 +2044,59 @@ static void ggml_compute_forward_concat_f32(
     int64_t o[4] = {0, 0, 0, 0};
     o[dim] = src0->ne[dim];
 
+    // Fast path: when concatenating along dim>=1 and the inner dim0 rows of src and
+    // dst are contiguous f32, each (i1,i2,i3) row is a whole contiguous span we can
+    // memcpy, and we parallelize over the FULL flattened (i3,i2,i1) space instead of
+    // only i2. The generic path below strides one float at a time over i2%nth cores
+    // — for the Flux QKV concat that is 24 heads on a 96-core box (75% idle) plus
+    // per-element address math. This makes it embarrassingly parallel + bandwidth-bound.
+    if (dim >= 1 &&
+        nb00 == sizeof(float) && nb0 == sizeof(float) &&
+        nb10 == sizeof(float)) {
+        const int64_t rows = ne1 * ne2 * ne3;
+        for (int64_t r = ith; r < rows; r += nth) {
+            const int64_t i1 = r % ne1;
+            const int64_t i2 = (r / ne1) % ne2;
+            const int64_t i3 = r / (ne1 * ne2);
+
+            float * dst_row = (float *)((char *)dst->data + i1*nb1 + i2*nb2 + i3*nb3);
+            if (i1 < ne01 && i2 < ne02 && i3 < ne03) {
+                const float * src_row = (const float *)((const char *)src0->data + i1*nb01 + i2*nb02 + i3*nb03);
+                memcpy(dst_row, src_row, ne00 * sizeof(float));
+                // If dst is wider than src0 along dim0 (only when dim==0, excluded here),
+                // the tail would come from src1; dim>=1 guarantees ne0==ne00==ne10.
+            } else {
+                const float * src_row = (const float *)((const char *)src1->data +
+                    (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13);
+                memcpy(dst_row, src_row, ne10 * sizeof(float));
+            }
+        }
+        return;
+    }
+
+    // Fast path for dim==0 (concatenate along the contiguous inner axis): each
+    // (i1,i2,i3) dst row = src0's ne00 floats followed by src1's ne10 floats, both
+    // contiguous, so two memcpys per row. Parallelize over the full row space. This
+    // is the Flux single-block attn||mlp concat (dim0 3072+12288, 38 blocks) — big
+    // and previously single-i2-strided + scalar.
+    if (dim == 0 &&
+        nb00 == sizeof(float) && nb01 == (size_t)ne00 * sizeof(float) &&
+        nb10 == sizeof(float) && nb11 == (size_t)ne10 * sizeof(float) &&
+        nb0  == sizeof(float)) {
+        const int64_t rows = ne1 * ne2 * ne3;
+        for (int64_t r = ith; r < rows; r += nth) {
+            const int64_t i1 = r % ne1;
+            const int64_t i2 = (r / ne1) % ne2;
+            const int64_t i3 = r / (ne1 * ne2);
+            char * dst_row = (char *)dst->data + i1*nb1 + i2*nb2 + i3*nb3;
+            const float * s0 = (const float *)((const char *)src0->data + i1*nb01 + i2*nb02 + i3*nb03);
+            const float * s1 = (const float *)((const char *)src1->data + i1*nb11 + i2*nb12 + i3*nb13);
+            memcpy(dst_row,                         s0, ne00 * sizeof(float));
+            memcpy(dst_row + ne00 * sizeof(float),  s1, ne10 * sizeof(float));
+        }
+        return;
+    }
+
     const float * x;
 
     // TODO: smarter multi-theading

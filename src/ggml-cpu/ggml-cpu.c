@@ -50,6 +50,10 @@
 #include "llamafile/sgemm.h"
 #endif
 
+#ifdef GGML_USE_ONEDNN
+#include "ggml-onednn.h"
+#endif
+
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
 #    include "spacemit/ime.h"
 #endif
@@ -1353,6 +1357,43 @@ UseGgmlGemm1:;
     }
 
     ggml_barrier(params->threadpool);
+
+#if GGML_USE_ONEDNN
+    // edge-dit: bf16 weights x bf16 activations (already converted into wdata) ->
+    // route large matmuls through oneDNN (Intel AMX bf16). ith==0 enters; oneDNN
+    // parallelizes internally while other workers wait on the barrier below.
+    if (src0->type == GGML_TYPE_BF16 && vec_dot_type == GGML_TYPE_BF16 &&
+        src1->type != vec_dot_type &&  // activations were converted into wdata
+        !getenv("ED_ONEDNN_OFF") &&
+        ggml_is_contiguous(src0) &&
+        ne01 >= 32 && ne11 >= 32 && ne00 >= 32) {
+        if (ith == 0) {
+            const int64_t r2 = ne12 / ne02;
+            const int64_t r3 = ne13 / ne03;
+            const void* wdata = params->wdata;
+            const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+            bool ok = true;
+            for (int64_t i13 = 0; i13 < ne13 && ok; i13++) {
+                for (int64_t i12 = 0; i12 < ne12 && ok; i12++) {
+                    ok = ed_onednn_sgemm_bf16(
+                        ne01, ne11, ne00,
+                        (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
+                        nb01 / sizeof(ggml_bf16_t),
+                        (const char *)wdata + (i12*ne11 + i13*ne12*ne11)*row_size,
+                        row_size / sizeof(ggml_bf16_t),
+                        (char *)dst->data + i12*nb2 + i13*nb3,
+                        nb1 / sizeof(float));
+                }
+            }
+            atomic_store_explicit(&params->threadpool->current_chunk, ok ? -1 : nth, memory_order_relaxed);
+        }
+        ggml_barrier(params->threadpool);
+        if (atomic_load_explicit(&params->threadpool->current_chunk, memory_order_relaxed) == -1) {
+            return;
+        }
+        // oneDNN failed: current_chunk reset to nth; fall through to ggml gemm.
+    }
+#endif
 
 #if GGML_USE_LLAMAFILE
     if (src1->type != vec_dot_type) {
@@ -3010,6 +3051,134 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+// ---- edge-dit: per-op CPU profiling (opt-in via GGML_CPU_PROFILE=1) ----
+// Aggregates wall-clock time per op type. Only thread ith==0 records, framed by
+// the per-node ggml_barrier, so each sample covers all threads computing that node.
+// Zero overhead when disabled (single cached bool check).
+static bool     g_ed_cpu_prof_enabled = false;
+static bool     g_ed_cpu_prof_checked = false;
+static int64_t  g_ed_cpu_prof_time_us[GGML_OP_COUNT]  = {0};
+static int64_t  g_ed_cpu_prof_calls[GGML_OP_COUNT]    = {0};
+static int64_t  g_ed_cpu_prof_flops[GGML_OP_COUNT]    = {0};
+
+// Exact FLOP count per node for matmul-class ops (hardware/clock independent).
+// Lets us compare edge-dit's matmul work against diffusers' FlopCounterMode to
+// settle whether a time gap is redundant compute or per-FLOP speed (AMX vs AVX512).
+static int64_t ggml_ed_op_flops(const struct ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID: {
+            const struct ggml_tensor * a = node->src[0];
+            const struct ggml_tensor * b = node->src[1];
+            if (!a || !b) { return 0; }
+            // result ne = {a->ne[1], b->ne[1], b->ne[2], b->ne[3]}; contraction K = a->ne[0]
+            return 2LL * a->ne[0] * a->ne[1] * b->ne[1] * b->ne[2] * b->ne[3];
+        }
+        case GGML_OP_FLASH_ATTN_EXT: {
+            const struct ggml_tensor * q = node->src[0];
+            const struct ggml_tensor * k = node->src[1];
+            if (!q || !k) { return 0; }
+            // q: [head_dim, n_q, n_head, batch]; k: [head_dim, n_kv, n_head_kv, batch]
+            // QK^T + softmax(.)V, each 2*head_dim*n_q*n_kv MACs per head per batch
+            const int64_t head_dim = q->ne[0];
+            const int64_t n_q      = q->ne[1];
+            const int64_t n_head   = q->ne[2];
+            const int64_t batch    = q->ne[3];
+            const int64_t n_kv     = k->ne[1];
+            return 4LL * head_dim * n_q * n_kv * n_head * batch;
+        }
+        default: return 0;
+    }
+}
+
+static bool ggml_ed_cpu_profile_enabled(void) {
+    if (!g_ed_cpu_prof_checked) {
+        const char * env = getenv("GGML_CPU_PROFILE");
+        g_ed_cpu_prof_enabled = env && env[0] && env[0] != '0';
+        g_ed_cpu_prof_checked = true;
+    }
+    return g_ed_cpu_prof_enabled;
+}
+
+// Sub-profiling for GGML_OP_CUSTOM by node-name prefix. All the edge-dit custom
+// callbacks (rope/modulation/norm/attention) collapse into one GGML_OP_CUSTOM
+// bucket, hiding which kind dominates. Bucket by a coarse name match so we can see
+// where CUSTOM time actually goes before optimizing the wrong one.
+enum { ED_CUSTOM_ROPE = 0, ED_CUSTOM_MODULATE, ED_CUSTOM_NORM, ED_CUSTOM_ATTN, ED_CUSTOM_OTHER, ED_CUSTOM_KINDS };
+static const char * g_ed_custom_kind_name[ED_CUSTOM_KINDS] = { "custom:rope", "custom:modulate", "custom:norm", "custom:attn", "custom:other" };
+static int64_t g_ed_custom_time_us[ED_CUSTOM_KINDS] = {0};
+static int64_t g_ed_custom_calls[ED_CUSTOM_KINDS]   = {0};
+
+static int ggml_ed_custom_kind(const char * name) {
+    if (!name || !name[0]) { return ED_CUSTOM_OTHER; }
+    if (strstr(name, "rope")) { return ED_CUSTOM_ROPE; }
+    if (strstr(name, "modulat")) { return ED_CUSTOM_MODULATE; }
+    if (strstr(name, "norm")) { return ED_CUSTOM_NORM; }
+    if (strstr(name, "attn") || strstr(name, "attention")) { return ED_CUSTOM_ATTN; }
+    return ED_CUSTOM_OTHER;
+}
+
+static void ggml_ed_cpu_profile_print_reset(void) {
+    int64_t total_us = 0;
+    for (int i = 0; i < GGML_OP_COUNT; i++) {
+        total_us += g_ed_cpu_prof_time_us[i];
+    }
+    if (total_us <= 0) {
+        return;
+    }
+    // sort op indices by time desc
+    int order[GGML_OP_COUNT];
+    for (int i = 0; i < GGML_OP_COUNT; i++) { order[i] = i; }
+    for (int i = 0; i < GGML_OP_COUNT; i++) {
+        for (int j = i + 1; j < GGML_OP_COUNT; j++) {
+            if (g_ed_cpu_prof_time_us[order[j]] > g_ed_cpu_prof_time_us[order[i]]) {
+                int t = order[i]; order[i] = order[j]; order[j] = t;
+            }
+        }
+    }
+    GGML_LOG_INFO("=== edge-dit CPU op profile (per graph_compute) ===\n");
+    GGML_LOG_INFO("%-20s %10s %8s %12s %10s %12s %10s\n", "op", "total_ms", "calls", "mean_us", "pct", "GFLOP", "GFLOP/s");
+    int64_t total_flops = 0;
+    for (int i = 0; i < GGML_OP_COUNT; i++) {
+        int op = order[i];
+        if (g_ed_cpu_prof_calls[op] == 0) { continue; }
+        double total_ms = g_ed_cpu_prof_time_us[op] / 1000.0;
+        double mean_us  = (double) g_ed_cpu_prof_time_us[op] / (double) g_ed_cpu_prof_calls[op];
+        double pct      = 100.0 * (double) g_ed_cpu_prof_time_us[op] / (double) total_us;
+        double gflop    = g_ed_cpu_prof_flops[op] / 1e9;
+        double gflops   = g_ed_cpu_prof_time_us[op] > 0 ? (g_ed_cpu_prof_flops[op] / 1e3) / (double) g_ed_cpu_prof_time_us[op] : 0.0;
+        total_flops    += g_ed_cpu_prof_flops[op];
+        GGML_LOG_INFO("%-20s %10.2f %8lld %12.1f %9.1f%% %12.3f %10.1f\n",
+                      ggml_op_name((enum ggml_op) op), total_ms,
+                      (long long) g_ed_cpu_prof_calls[op], mean_us, pct, gflop, gflops);
+    }
+    GGML_LOG_INFO("%-20s %10.2f %8s %12s %10s %12.3f\n", "TOTAL", total_us / 1000.0, "", "", "", total_flops / 1e9);
+    // CUSTOM sub-breakdown by kind (only if any custom ran this graph)
+    int64_t custom_any = 0;
+    for (int i = 0; i < ED_CUSTOM_KINDS; i++) { custom_any += g_ed_custom_calls[i]; }
+    if (custom_any > 0) {
+        GGML_LOG_INFO("  -- CUSTOM breakdown by kind --\n");
+        for (int i = 0; i < ED_CUSTOM_KINDS; i++) {
+            if (g_ed_custom_calls[i] == 0) { continue; }
+            double tms = g_ed_custom_time_us[i] / 1000.0;
+            double mus = (double) g_ed_custom_time_us[i] / (double) g_ed_custom_calls[i];
+            GGML_LOG_INFO("  %-18s %10.2f %8lld %12.1f\n",
+                          g_ed_custom_kind_name[i], tms, (long long) g_ed_custom_calls[i], mus);
+        }
+    }
+    GGML_LOG_INFO("===================================================\n");
+    // reset for next graph
+    for (int i = 0; i < GGML_OP_COUNT; i++) {
+        g_ed_cpu_prof_time_us[i] = 0;
+        g_ed_cpu_prof_calls[i]   = 0;
+        g_ed_cpu_prof_flops[i]   = 0;
+    }
+    for (int i = 0; i < ED_CUSTOM_KINDS; i++) {
+        g_ed_custom_time_us[i] = 0;
+        g_ed_custom_calls[i]   = 0;
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3052,11 +3221,29 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
+        const bool ed_prof = (state->ith == 0) && ggml_ed_cpu_profile_enabled();
+        const int64_t ed_t0 = ed_prof ? ggml_time_us() : 0;
+        const enum ggml_op ed_op = node->op;
+        const int64_t ed_flops = ed_prof ? ggml_ed_op_flops(node) : 0;
+        const int ed_custom_kind = (ed_prof && ed_op == GGML_OP_CUSTOM) ? ggml_ed_custom_kind(node->name) : -1;
+
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
+        }
+
+        if (ed_prof) {
+            // barrier below guarantees all threads finished this node before ith==0 continues
+            const int64_t ed_dt = ggml_time_us() - ed_t0;
+            g_ed_cpu_prof_time_us[ed_op] += ed_dt;
+            g_ed_cpu_prof_calls[ed_op]   += 1;
+            g_ed_cpu_prof_flops[ed_op]   += ed_flops;
+            if (ed_custom_kind >= 0) {
+                g_ed_custom_time_us[ed_custom_kind] += ed_dt;
+                g_ed_custom_calls[ed_custom_kind]   += 1;
+            }
         }
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -3367,6 +3554,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
+
+    // edge-dit: print & reset per-op profile (all workers joined, main thread only)
+    if (ggml_ed_cpu_profile_enabled()) {
+        ggml_ed_cpu_profile_print_reset();
+    }
 
     enum ggml_status ret = threadpool->ec;
 

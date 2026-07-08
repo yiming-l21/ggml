@@ -13,6 +13,7 @@
 
 #include <dnnl.hpp>
 #include "oneapi/dnnl/dnnl_threadpool.hpp"
+#include "oneapi/dnnl/dnnl_ukernel.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -370,3 +371,159 @@ extern "C" bool ed_onednn_conv2d_bf16(int64_t N, int64_t IC, int64_t IH, int64_t
         return false;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fused flash attention via brgemm ukernel (AMX bf16). Online softmax; the
+// [n_q,n_kv] scores never fully materialize (only a qBlk x kvBlk tile at a time).
+// Correctness-first: scalar exp/softmax (SIMD optimization is a follow-up).
+// Requires an oneDNN built with DNNL_EXPERIMENTAL_UKERNEL; otherwise the entry
+// point below returns false and the caller falls back to ggml's flash attention.
+// ---------------------------------------------------------------------------
+#include <cmath>
+#include <cstring>
+
+#ifdef DNNL_EXPERIMENTAL_UKERNEL
+namespace {
+using namespace dnnl::ukernel;
+
+inline float ed_ld(const void* base, int type, int64_t idx){
+    // type: 0=f32, 1=f16
+    if (type == 0) return ((const float*)base)[idx];
+    // f16 -> f32
+    uint16_t h = ((const uint16_t*)base)[idx];
+    uint32_t sign = (h & 0x8000u) << 16;
+    uint32_t exp  = (h >> 10) & 0x1f;
+    uint32_t man  =  h & 0x3ff;
+    uint32_t f;
+    if (exp == 0){ if(man==0){ f=sign; } else { exp=127-15+1; while(!(man&0x400)){man<<=1;exp--;} man&=0x3ff; f=sign|(exp<<23)|(man<<13);} }
+    else if (exp == 0x1f){ f = sign | 0x7f800000u | (man<<13); }
+    else { f = sign | ((exp + (127-15))<<23) | (man<<13); }
+    float r; std::memcpy(&r,&f,4); return r;
+}
+inline uint16_t ed_f2bf16(float f){ uint32_t u; std::memcpy(&u,&f,4); return (uint16_t)((u + 0x7fff + ((u>>16)&1)) >> 16); }
+
+// Per-thread cached brgemm kernels + packing (shapes fixed per call site; qBlk/kvBlk const).
+struct FlashKernels {
+    int64_t d=0, qB=0, kB=0;
+    brgemm qk, pv;
+    transform packKT, packV;
+    size_t qk_sp=0, pv_sp=0;
+    bool ok=false;
+    void build(int64_t d_, int64_t qB_, int64_t kB_){
+        if (ok && d==d_ && qB==qB_ && kB==kB_) return;
+        d=d_; qB=qB_; kB=kB_;
+        using dt = memory::data_type;
+        qk = brgemm(qB,kB,d,1,d,kB,kB, dt::bf16,dt::bf16,dt::f32); qk.finalize(); qk.generate(); qk_sp=qk.get_scratchpad_size();
+        pv = brgemm(qB,d,kB,1,kB,d,d,  dt::bf16,dt::bf16,dt::f32); pv.finalize(); pv.generate(); pv_sp=pv.get_scratchpad_size();
+        packKT = transform(d,kB,pack_type::trans,   d,kB, dt::bf16,dt::bf16); packKT.generate();
+        packV  = transform(kB,d,pack_type::no_trans,d,d,  dt::bf16,dt::bf16); packV.generate();
+        ok=true;
+    }
+};
+thread_local FlashKernels g_fk;
+
+} // namespace
+
+extern "C" bool ed_onednn_flash_attn_bf16(
+    int ith, int nth,
+    int64_t d_head, int64_t n_q, int64_t n_kv, int64_t n_head, int64_t n_head_kv, int64_t batch,
+    float scale,
+    const void* q, int q_type, int64_t qb1, int64_t qb2, int64_t qb3,
+    const void* k, int k_type, int64_t kb1, int64_t kb2, int64_t kb3,
+    const void* v, int v_type, int64_t vb1, int64_t vb2, int64_t vb3,
+    void* dst_f32, int64_t ob1, int64_t ob2, int64_t ob3)
+{
+    try {
+        const int64_t qBlk = 256, kvBlk = 512;
+        if (d_head > 256) return false;               // tile buffers sized for <=256
+        const int64_t nqb = (n_q + qBlk - 1) / qBlk;
+        const int64_t heads_ratio = n_head / (n_head_kv > 0 ? n_head_kv : 1);
+
+        g_fk.build(d_head, qBlk, kvBlk);
+        g_fk.qk.set_hw_context();
+
+        // thread-local scratch (grown as needed)
+        thread_local std::vector<uint8_t> sp_qk, sp_pv;
+        thread_local std::vector<uint16_t> Qb, KTp, Vp, Pb;
+        thread_local std::vector<float> S, acc, m_i, l_i;
+        sp_qk.resize(g_fk.qk_sp); sp_pv.resize(g_fk.pv_sp);
+        Qb.resize((size_t)qBlk*d_head);
+        KTp.resize((size_t)d_head*kvBlk); Vp.resize((size_t)kvBlk*d_head);
+        S.resize((size_t)qBlk*kvBlk); Pb.resize((size_t)qBlk*kvBlk);
+        acc.resize((size_t)qBlk*d_head); m_i.resize(qBlk); l_i.resize(qBlk);
+        std::vector<std::pair<memory::dim,memory::dim>> off = {{0,0}};
+
+        const int64_t total = batch * n_head * nqb;   // work items
+        for (int64_t it = ith; it < total; it += nth) {
+            int64_t qb = it % nqb;
+            int64_t h  = (it / nqb) % n_head;
+            int64_t b  = it / (nqb * n_head);
+            int64_t hk = h / heads_ratio;             // kv head (GQA); =h if MHA
+            int64_t q0 = qb * qBlk, qn = std::min(qBlk, n_q - q0);
+
+            // ---- load & bf16-pack Q block: Qb[qn, d] ----
+            for (int64_t i=0;i<qn;++i){
+                const void* qrow_base = (const char*)q + (size_t)(b*qb3 + h*qb2 + (q0+i)*qb1)*(q_type==0?4:2);
+                for (int64_t dd=0; dd<d_head; ++dd) Qb[(size_t)i*d_head+dd] = ed_f2bf16(ed_ld(qrow_base,q_type,dd));
+            }
+            for (int64_t i=0;i<qn;++i){ m_i[i]=-1e30f; l_i[i]=0; }
+            std::fill(acc.begin(), acc.begin()+(size_t)qn*d_head, 0.0f);
+
+            for (int64_t k0=0;k0<n_kv;k0+=kvBlk){
+                int64_t kn = std::min(kvBlk, n_kv-k0);
+                // Build K block in NATURAL [kv, d] layout (bf16); packKT (pack_type::trans,
+                // in_ld=d) transposes+packs it into the [d, kvBlk] B operand for QK^T.
+                // Build V block [kv, d] (bf16); packV (no_trans) packs as-is.
+                thread_local std::vector<uint16_t> Kraw, Vraw;
+                Kraw.assign((size_t)kvBlk*d_head, 0); Vraw.assign((size_t)kvBlk*d_head, 0);
+                for (int64_t j=0;j<kn;++j){
+                    const void* krow = (const char*)k + (size_t)(b*kb3 + hk*kb2 + (k0+j)*kb1)*(k_type==0?4:2);
+                    const void* vrow = (const char*)v + (size_t)(b*vb3 + hk*vb2 + (k0+j)*vb1)*(v_type==0?4:2);
+                    for (int64_t dd=0; dd<d_head; ++dd){
+                        Kraw[(size_t)j*d_head + dd] = ed_f2bf16(ed_ld(krow,k_type,dd)); // [kv,d]
+                        Vraw[(size_t)j*d_head + dd] = ed_f2bf16(ed_ld(vrow,v_type,dd)); // [kv,d]
+                    }
+                }
+                g_fk.packKT.execute(Kraw.data(), KTp.data());  // trans: [kv,d] -> packed [d,kvBlk]
+                g_fk.packV.execute(Vraw.data(),  Vp.data());   // no_trans: [kv,d] packed
+                // S[qn,kvBlk] = Qb * KT
+                g_fk.qk.execute(Qb.data(), KTp.data(), off, S.data(), sp_qk.data());
+                // online softmax over [0,kn)
+                for (int64_t i=0;i<qn;++i){
+                    float* srow = &S[(size_t)i*kvBlk];
+                    float mprev=m_i[i], mcur=mprev;
+                    for (int64_t j=0;j<kn;++j){ srow[j]*=scale; if(srow[j]>mcur)mcur=srow[j]; }
+                    float alpha = std::exp(mprev-mcur), lsum=0;
+                    for (int64_t j=0;j<kn;++j){ float p=std::exp(srow[j]-mcur); Pb[(size_t)i*kvBlk+j]=ed_f2bf16(p); lsum+=p; }
+                    for (int64_t j=kn;j<kvBlk;++j) Pb[(size_t)i*kvBlk+j]=0;  // zero pad
+                    float* arow=&acc[(size_t)i*d_head]; for(int64_t dd=0;dd<d_head;++dd) arow[dd]*=alpha;
+                    l_i[i]=l_i[i]*alpha+lsum; m_i[i]=mcur;
+                }
+                // acc[qn,d] += P[qn,kvBlk] * Vp[kvBlk,d]  (tail rows of V are zero -> no effect)
+                thread_local std::vector<float> pvout; pvout.resize((size_t)qBlk*d_head);
+                g_fk.pv.execute(Pb.data(), Vp.data(), off, pvout.data(), sp_pv.data());
+                for (int64_t i=0;i<qn;++i){ float*a=&acc[(size_t)i*d_head]; float*p=&pvout[(size_t)i*d_head]; for(int64_t dd=0;dd<d_head;++dd) a[dd]+=p[dd]; }
+            }
+            // write dst[d_head, n_head, n_q, batch] layout: dst[:, h, q0+i, b]
+            for (int64_t i=0;i<qn;++i){
+                float inv = 1.0f / l_i[i]; float* a=&acc[(size_t)i*d_head];
+                float* orow = (float*)dst_f32 + (size_t)(b*ob3 + (q0+i)*ob2 + h*ob1);
+                for (int64_t dd=0; dd<d_head; ++dd) orow[dd] = a[dd]*inv;
+            }
+        }
+        return true;
+    } catch (const dnnl::error&) {
+        return false;
+    }
+}
+
+#else  // !DNNL_EXPERIMENTAL_UKERNEL — oneDNN lacks the brgemm ukernel; no fused flash.
+extern "C" bool ed_onednn_flash_attn_bf16(
+    int, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, float,
+    const void*, int, int64_t, int64_t, int64_t,
+    const void*, int, int64_t, int64_t, int64_t,
+    const void*, int, int64_t, int64_t, int64_t,
+    void*, int64_t, int64_t, int64_t) {
+    return false;  // caller falls back to ggml flash attention
+}
+#endif // DNNL_EXPERIMENTAL_UKERNEL

@@ -30,6 +30,25 @@ bool ed_onednn_conv2d_bf16(int64_t N, int64_t IC, int64_t IH, int64_t IW,
                            const void* wgt_bf16,
                            void* dst_f32);
 
+// Fused flash attention via oneDNN brgemm ukernel (AMX bf16), tiled with online
+// softmax so the [n_q, n_kv] score matrix is never materialized. Mirrors ATen's
+// cpu_flash_attention. Called per graph node; parallelizes internally over
+// (head, q-block) using ggml's thread ids (ith/nth). Returns false if the shape
+// is unsupported (caller falls back to ggml flash).
+//   q: [d_head, n_q,  n_head,    batch] strides qb1/qb2/qb3 (elements, d contiguous)
+//   k: [d_head, n_kv, n_head_kv, batch] strides kb1/kb2/kb3
+//   v: [d_head, n_kv, n_head_kv, batch] strides vb1/vb2/vb3  (d contiguous)
+//   dst: [d_head, n_head, n_q, batch]  strides ob1/ob2/ob3  (ggml flash output layout)
+//   q/k/v are f32 or f16 (per src_type flags); scale applied to QK^T; no mask (mask==null).
+bool ed_onednn_flash_attn_bf16(
+    int ith, int nth,
+    int64_t d_head, int64_t n_q, int64_t n_kv, int64_t n_head, int64_t n_head_kv, int64_t batch,
+    float scale,
+    const void* q, int q_type, int64_t qb1, int64_t qb2, int64_t qb3,
+    const void* k, int k_type, int64_t kb1, int64_t kb2, int64_t kb3,
+    const void* v, int v_type, int64_t vb1, int64_t vb2, int64_t vb3,
+    void* dst_f32, int64_t ob1, int64_t ob2, int64_t ob3);
+
 #ifdef __cplusplus
 }
 #endif

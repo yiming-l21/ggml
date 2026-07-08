@@ -9024,6 +9024,49 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+#if GGML_USE_ONEDNN
+    // edge-dit: fused bf16 AMX flash attention (brgemm ukernel). Handles the common
+    // no-mask, no-softcap, f16/f32 case; falls back to ggml otherwise. Env kill-switch
+    // ED_ONEDNN_FLASH_OFF. dst layout is [DV, n_head, n_q, batch].
+    {
+        const ggml_tensor * q = dst->src[0];
+        const ggml_tensor * k = dst->src[1];
+        const ggml_tensor * v = dst->src[2];
+        const ggml_tensor * mask = dst->src[3];
+        float scale = 1.0f, max_bias = 0.0f, logit_softcap = 0.0f;
+        memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+        memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+        memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+        const bool typ_ok = (q->type==GGML_TYPE_F32||q->type==GGML_TYPE_F16) &&
+                            (k->type==GGML_TYPE_F32||k->type==GGML_TYPE_F16) &&
+                            (v->type==GGML_TYPE_F32||v->type==GGML_TYPE_F16);
+        if (typ_ok && mask==nullptr && max_bias==0.0f && logit_softcap==0.0f &&
+            q->ne[0]==v->ne[0] && dst->type==GGML_TYPE_F32 &&
+            !getenv("ED_ONEDNN_FLASH_OFF")) {
+            const int64_t d_head = q->ne[0];
+            const int64_t n_q = q->ne[1], n_head = q->ne[2], batch = q->ne[3];
+            const int64_t n_kv = k->ne[1], n_head_kv = k->ne[2];
+            const int esz_q = (q->type==GGML_TYPE_F32)?4:2;
+            const int esz_k = (k->type==GGML_TYPE_F32)?4:2;
+            const int esz_v = (v->type==GGML_TYPE_F32)?4:2;
+            if (params->ith==0 && getenv("ED_FLASH_DEBUG")) {
+                fprintf(stderr,"[edflash] d=%ld nq=%ld nkv=%ld nh=%ld nhkv=%ld b=%ld scale=%.4f qtype=%d ktype=%d vtype=%d\n",
+                    (long)d_head,(long)n_q,(long)n_kv,(long)n_head,(long)n_head_kv,(long)batch,scale,(int)q->type,(int)k->type,(int)v->type);
+                fprintf(stderr,"[edflash] q.nb=%zu,%zu,%zu,%zu k.nb=%zu,%zu,%zu,%zu v.nb=%zu,%zu,%zu,%zu dst.ne=%ld,%ld,%ld,%ld dst.nb=%zu,%zu,%zu,%zu\n",
+                    q->nb[0],q->nb[1],q->nb[2],q->nb[3], k->nb[0],k->nb[1],k->nb[2],k->nb[3], v->nb[0],v->nb[1],v->nb[2],v->nb[3],
+                    (long)dst->ne[0],(long)dst->ne[1],(long)dst->ne[2],(long)dst->ne[3], dst->nb[0],dst->nb[1],dst->nb[2],dst->nb[3]);
+            }
+            bool ok = ed_onednn_flash_attn_bf16(
+                params->ith, params->nth,
+                d_head, n_q, n_kv, n_head, n_head_kv, batch, scale,
+                q->data, q->type, q->nb[1]/esz_q, q->nb[2]/esz_q, q->nb[3]/esz_q,
+                k->data, k->type, k->nb[1]/esz_k, k->nb[2]/esz_k, k->nb[3]/esz_k,
+                v->data, v->type, v->nb[1]/esz_v, v->nb[2]/esz_v, v->nb[3]/esz_v,
+                dst->data, dst->nb[1]/4, dst->nb[2]/4, dst->nb[3]/4);
+            if (ok) { return; }
+        }
+    }
+#endif
     switch (dst->op_params[3]) {
         case GGML_PREC_DEFAULT:
         case GGML_PREC_F32:

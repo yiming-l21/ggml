@@ -2405,6 +2405,17 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_with_type(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap,
+            enum ggml_type        result_type);
+
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);

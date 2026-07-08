@@ -5335,8 +5335,22 @@ struct ggml_tensor * ggml_flash_attn_ext(
         float                 scale,
         float                 max_bias,
         float                 logit_softcap) {
+    return ggml_flash_attn_ext_with_type(ctx, q, k, v, mask, scale, max_bias, logit_softcap, GGML_TYPE_F32);
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_with_type(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap,
+        enum ggml_type        result_type) {
     GGML_ASSERT(ggml_can_mul_mat(k, q));
     // TODO: check if vT can be multiplied by (k*qT)
+    GGML_ASSERT(result_type == GGML_TYPE_F32 || result_type == GGML_TYPE_F16);
 
     GGML_ASSERT(q->ne[3] == k->ne[3]);
     GGML_ASSERT(q->ne[3] == v->ne[3]);
@@ -5356,7 +5370,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
 
     // permute(0, 2, 1, 3)
     int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    struct ggml_tensor * result = ggml_new_tensor(ctx, result_type, 4, ne);
 
     float params[] = { scale, max_bias, logit_softcap };
     ggml_set_op_params(result, params, sizeof(params));

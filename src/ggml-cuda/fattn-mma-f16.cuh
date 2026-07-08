@@ -1113,9 +1113,10 @@ template<int DV, int ncols> struct mma_tile_sizes {
 };
 #endif // defined(TURING_MMA_AVAILABLE)
 
-template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool V_is_K_view, bool needs_fixup, bool is_fixup>
+template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool V_is_K_view, bool needs_fixup, bool is_fixup, bool Q_is_f16>
 static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const float2 * const __restrict__ Q_f2,
+        const half2  * const __restrict__ Q_h2,
         const half2  * const __restrict__ K_h2,
         const half2  * const __restrict__ V_h2,
         const half   * const __restrict__ mask_h,
@@ -1226,8 +1227,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
                     const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
 
-                    const float2 tmp = Q_f2[(jt*ncols1 + j)*stride_Q1 + c*stride_Q2 + k];
-                    tile_Q[jc*stride_tile_Q + k] = scale_h2 * make_half2(tmp.x, tmp.y);
+                    if constexpr (Q_is_f16) {
+                        tile_Q[jc*stride_tile_Q + k] = scale_h2 * Q_h2[(jt*ncols1 + j)*stride_Q1 + c*stride_Q2 + k];
+                    } else {
+                        const float2 tmp = Q_f2[(jt*ncols1 + j)*stride_Q1 + c*stride_Q2 + k];
+                        tile_Q[jc*stride_tile_Q + k] = scale_h2 * make_half2(tmp.x, tmp.y);
+                    }
                 }
             } else {
 #pragma unroll
@@ -1692,7 +1697,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dstk_fixup,
+    GGML_UNUSED_VARS(Q_f2, Q_h2, K_h2, V_h2, mask_h, sinks_f, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02, gqa_ratio,
         stride_Q1, stride_Q2, stride_K, stride_V, stride_mask,
         jt, kb0_start, kb0_stop);
@@ -1700,7 +1705,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view>
+template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool Q_is_f16>
 __launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_ext_f16(
         const char * __restrict__ Q,
@@ -1771,8 +1776,8 @@ static __global__ void flash_attn_ext_f16(
 
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
 
-    const int stride_Q1   = nb01 / sizeof(float2);
-    const int stride_Q2   = nb02 / sizeof(float2);
+    const int stride_Q1   = Q_is_f16 ? nb01 / sizeof(half2) : nb01 / sizeof(float2);
+    const int stride_Q2   = Q_is_f16 ? nb02 / sizeof(half2) : nb02 / sizeof(float2);
     const int stride_K    = nb11 / sizeof(half2);
     const int stride_mask = nb31 / sizeof(half);
 
@@ -1803,7 +1808,9 @@ static __global__ void flash_attn_ext_f16(
 
         const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 
-        const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
+        const char   * Q_data = Q + nb03*sequence + nb02*zt_Q;
+        const float2 * Q_f2   = (const float2 *) Q_data;
+        const half2  * Q_h2   = (const half2  *) Q_data;
         const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
         const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
             (const half *) (mask + nb33*(sequence % ne33));
@@ -1820,13 +1827,13 @@ static __global__ void flash_attn_ext_f16(
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         if (kb0_start == 0) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
-            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
-                (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, Q_is_f16>
+                (Q_f2, Q_h2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
-            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
-                (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, Q_is_f16>
+                (Q_f2, Q_h2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         }
 
@@ -1849,7 +1856,9 @@ static __global__ void flash_attn_ext_f16(
 
     const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
 
-    const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
+    const char   * Q_data = Q + nb03*sequence + nb02*zt_Q;
+    const float2 * Q_f2   = (const float2 *) Q_data;
+    const half2  * Q_h2   = (const half2  *) Q_data;
     const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
     const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
         (const half *) (mask + nb33*(sequence % ne33));
@@ -1866,8 +1875,8 @@ static __global__ void flash_attn_ext_f16(
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     constexpr bool needs_fixup = false;
-    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
-        (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, Q_is_f16>
+        (Q_f2, Q_h2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
 #else
     GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
@@ -1886,6 +1895,7 @@ static __global__ void flash_attn_ext_f16(
 template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
+    const ggml_tensor * Q   = dst->src[0];
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
 
@@ -1919,6 +1929,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+    const bool q_is_f16 = Q->type == GGML_TYPE_F16;
 
 #if defined(GGML_USE_HIP)
     using fattn_kernel_ptr_t = const void*;
@@ -1928,30 +1939,42 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     fattn_kernel_t fattn_kernel;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view>;
+        if (q_is_f16) {
+            constexpr bool Q_is_f16 = true;
+            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, Q_is_f16>;
+        } else {
+            constexpr bool Q_is_f16 = false;
+            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, Q_is_f16>;
+        }
 
 #if !defined(GGML_USE_MUSA)
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-        if (!shared_memory_limit_raised[id]) {
+        static bool shared_memory_limit_raised[2][GGML_CUDA_MAX_DEVICES] = {};
+        if (!shared_memory_limit_raised[q_is_f16][id]) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = true;
+            shared_memory_limit_raised[q_is_f16][id] = true;
         }
 #endif // !defined(GGML_USE_MUSA)
     } else {
         constexpr bool use_logit_softcap = true;
-        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view>;
+        if (q_is_f16) {
+            constexpr bool Q_is_f16 = true;
+            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, Q_is_f16>;
+        } else {
+            constexpr bool Q_is_f16 = false;
+            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, Q_is_f16>;
+        }
 
 #if !defined(GGML_USE_MUSA)
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-        if (!shared_memory_limit_raised[id]) {
+        static bool shared_memory_limit_raised[2][GGML_CUDA_MAX_DEVICES] = {};
+        if (!shared_memory_limit_raised[q_is_f16][id]) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = true;
+            shared_memory_limit_raised[q_is_f16][id] = true;
         }
 #endif // !defined(GGML_USE_MUSA)
     }
 
     launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, warp_size_host);
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, warp_size_host, q_is_f16);
 }
 
 

@@ -419,6 +419,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     const int cc = ggml_cuda_info().devices[device].cc;
+    if (Q->type != GGML_TYPE_F32 && Q->type != GGML_TYPE_F16) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
+    const bool q_is_f16 = Q->type == GGML_TYPE_F16;
+    if (q_is_f16 && (Q->ne[0] != 128 || K->ne[0] != 128 || V->ne[0] != 128)) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+    if (q_is_f16 && !turing_mma_available(cc) && !volta_mma_available(cc)) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
 
     switch (K->ne[0]) {
         case  40:
@@ -503,6 +514,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        if (q_is_f16) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
@@ -533,6 +547,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        if (q_is_f16) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
@@ -543,6 +560,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // Use the WMMA kernel if possible:
+    if (q_is_f16) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
     if (ggml_cuda_should_use_wmma_fattn(cc) && K->ne[1] % FATTN_KQ_STRIDE == 0 && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[0] != 192 && Q->ne[0] != 512 && Q->ne[0] != 576) {
         if (can_use_vector_kernel && Q->ne[1] <= 2) {
             return BEST_FATTN_KERNEL_VEC;

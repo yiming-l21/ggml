@@ -916,7 +916,8 @@ static __global__ void flash_attn_combine_results(
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
+    const bool allow_f16_Q = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -931,7 +932,7 @@ void launch_fattn(
 
     ggml_tensor * KQV = dst;
 
-    GGML_ASSERT(Q->type == GGML_TYPE_F32);
+    GGML_ASSERT(Q->type == GGML_TYPE_F32 || (allow_f16_Q && Q->type == GGML_TYPE_F16));
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
 
     GGML_ASSERT(Q->nb[0] == ggml_element_size(Q));

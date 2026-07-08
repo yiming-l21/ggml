@@ -34,6 +34,7 @@ struct qwen_fused_qkv_pack_cuda_params {
     int64_t img_padded_seq;
     int64_t world_size;
     int64_t stream_index;
+    float scale;
 };
 
 static bool ggml_cuda_qwen_fused_qkv_pack_name_matches(const ggml_tensor* dst) {
@@ -148,6 +149,8 @@ static const char* ggml_cuda_qwen_fused_profile_mode_detail(int64_t mode) {
             return "joint_qk_recv_pack";
         case 51:
             return "joint_v_recv_pack";
+        case 52:
+            return "scale_to_f16";
         case 33:
             return "wan_qkv_vhalf_send_pack";
         case 37:
@@ -352,6 +355,28 @@ static __global__ void qwen_fused_qkv_pack_f32_kernel(const char* __restrict__ t
             value = *reinterpret_cast<const float*>(src + d * nb0 + src_t * nb1 + head * nb2);
         }
         dst[linear] = value;
+    }
+}
+
+static __global__ void qwen_fused_scale_f32_to_f16_kernel(const float* __restrict__ src,
+                                                          half* __restrict__ dst,
+                                                          float scale,
+                                                          int64_t total) {
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        dst[linear] = __float2half_rn(src[linear] * scale);
+    }
+}
+
+static __global__ void qwen_fused_scale_f16_to_f16_kernel(const half* __restrict__ src,
+                                                          half* __restrict__ dst,
+                                                          float scale,
+                                                          int64_t total) {
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        dst[linear] = __float2half_rn(__half2float(src[linear]) * scale);
     }
 }
 
@@ -2113,6 +2138,61 @@ static __global__ void qwen_fused_attn_head_to_seq_send_pack_f16_h2_kernel(const
     }
 }
 
+static __global__ void qwen_fused_attn_head_to_seq_send_pack_f32_to_f16_h2_kernel(
+    const char* __restrict__ attn,
+    half2* __restrict__ dst,
+    int64_t txt_real_seq,
+    int64_t img_real_seq,
+    int64_t txt_padded_seq,
+    int64_t img_padded_seq,
+    int64_t world_size,
+    int64_t head_dim,
+    int64_t shard_heads,
+    size_t attn_nb0,
+    size_t attn_nb1,
+    size_t attn_nb2,
+    size_t attn_nb3) {
+    const int64_t head_dim2 = head_dim / 2;
+    const int64_t txt_shard_seq = txt_padded_seq / world_size;
+    const int64_t img_shard_seq = img_padded_seq / world_size;
+    const int64_t txt_chunk2 = head_dim2 * shard_heads * txt_shard_seq;
+    const int64_t img_chunk2 = head_dim2 * shard_heads * img_shard_seq;
+    const int64_t count_per_peer2 = txt_chunk2 + img_chunk2;
+    const int64_t total = count_per_peer2 * world_size;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem = linear;
+        const int64_t peer = rem / count_per_peer2;
+        rem -= peer * count_per_peer2;
+        const bool is_img = rem >= txt_chunk2;
+        if (is_img) {
+            rem -= txt_chunk2;
+        }
+        const int64_t shard_seq = is_img ? img_shard_seq : txt_shard_seq;
+        const int64_t stream_real_seq = is_img ? img_real_seq : txt_real_seq;
+        const int64_t d2 = rem % head_dim2;
+        rem /= head_dim2;
+        const int64_t head = rem % shard_heads;
+        rem /= shard_heads;
+        const int64_t local_tok = rem;
+        const int64_t stream_tok = peer * shard_seq + local_tok;
+
+        half2 value = make_half2(0.0f, 0.0f);
+        if (stream_tok < stream_real_seq) {
+            const int64_t total_tok = is_img ? txt_real_seq + stream_tok : stream_tok;
+            const char* src = attn +
+                              (2 * d2) * attn_nb0 +
+                              head * attn_nb1 +
+                              total_tok * attn_nb2 +
+                              0 * attn_nb3;
+            value = __float22half2_rn(*reinterpret_cast<const float2*>(src));
+        }
+        dst[linear] = value;
+    }
+}
+
 static __global__ void qwen_fused_attn_head_to_seq_recv_unpack_f16_kernel(const half* __restrict__ recv_flat,
                                                                           float* __restrict__ dst,
                                                                           int64_t stream_index,
@@ -2149,6 +2229,51 @@ static __global__ void qwen_fused_attn_head_to_seq_recv_unpack_f16_kernel(const 
             local_head * head_dim +
             local_tok * head_dim * shard_heads;
         dst[linear] = __half2float(recv_flat[src_idx]);
+    }
+}
+
+static __global__ void qwen_fused_attn_head_to_seq_recv_unpack_f16_h2_kernel(
+    const half* __restrict__ recv_flat,
+    float* __restrict__ dst,
+    int64_t stream_index,
+    int64_t txt_padded_seq,
+    int64_t img_padded_seq,
+    int64_t world_size,
+    int64_t head_dim,
+    int64_t heads) {
+    const int64_t shard_heads = heads / world_size;
+    const int64_t head_dim2 = head_dim / 2;
+    const int64_t txt_shard_seq = txt_padded_seq / world_size;
+    const int64_t img_shard_seq = img_padded_seq / world_size;
+    const int64_t out_shard_seq = stream_index == 0 ? txt_shard_seq : img_shard_seq;
+    const int64_t txt_chunk = head_dim * shard_heads * txt_shard_seq;
+    const int64_t img_chunk = head_dim * shard_heads * img_shard_seq;
+    const int64_t count_per_peer = txt_chunk + img_chunk;
+    const int64_t stream_offset = stream_index == 0 ? 0 : txt_chunk;
+    const int64_t total = head_dim2 * heads * out_shard_seq;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem = linear;
+        const int64_t d2 = rem % head_dim2;
+        rem /= head_dim2;
+        const int64_t head = rem % heads;
+        rem /= heads;
+        const int64_t local_tok = rem;
+        const int64_t src_peer = head / shard_heads;
+        const int64_t local_head = head - src_peer * shard_heads;
+        const int64_t src_idx =
+            src_peer * count_per_peer +
+            stream_offset +
+            2 * d2 +
+            local_head * head_dim +
+            local_tok * head_dim * shard_heads;
+        const int64_t dst_idx =
+            2 * d2 +
+            head_dim * (head + heads * local_tok);
+        *reinterpret_cast<float2*>(dst + dst_idx) =
+            __half22float2(*reinterpret_cast<const half2*>(recv_flat + src_idx));
     }
 }
 
@@ -2837,6 +2962,104 @@ static __global__ void qwen_fused_qk_pack_from_joint_recv_f32_kernel(const char*
     }
 }
 
+static __global__ void qwen_fused_qk_pack_from_joint_recv_f16_kernel(const half* __restrict__ recv_flat,
+                                                                     float* __restrict__ dst,
+                                                                     int64_t txt_real_seq,
+                                                                     int64_t img_real_seq,
+                                                                     int64_t txt_padded_seq,
+                                                                     int64_t img_padded_seq,
+                                                                     int64_t world_size,
+                                                                     int64_t heads,
+                                                                     int64_t head_dim) {
+    const int64_t seq_total = txt_real_seq + img_real_seq;
+    const int64_t qk_half_dim = head_dim / 2;
+    const int64_t plane_elems = qk_half_dim * seq_total * heads;
+    const int64_t total = 4 * plane_elems;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int64_t plane = linear / plane_elems;
+        int64_t rem = linear - plane * plane_elems;
+        const int64_t half = rem % qk_half_dim;
+        rem /= qk_half_dim;
+        const int64_t tok = rem % seq_total;
+        const int64_t head = rem / seq_total;
+        const bool is_txt = tok < txt_real_seq;
+        const int64_t src_t = is_txt ? tok : tok - txt_real_seq;
+        const int64_t qkv_plane = plane / 2;
+        const int64_t part = plane % 2;
+        const int64_t src_d = qkv_plane * head_dim + part + 2 * half;
+        const int64_t src_idx = qwen_joint_qkv_recv_src_index(src_d,
+                                                              src_t,
+                                                              head,
+                                                              is_txt ? 0 : 1,
+                                                              head_dim,
+                                                              heads,
+                                                              txt_padded_seq,
+                                                              img_padded_seq,
+                                                              world_size);
+        dst[linear] = __half2float(recv_flat[src_idx]);
+    }
+}
+
+static __global__ void qwen_fused_qk_pack_from_joint_recv_f16_pair_kernel(const half* __restrict__ recv_flat,
+                                                                          float* __restrict__ dst,
+                                                                          int txt_real_seq,
+                                                                          int img_real_seq,
+                                                                          int txt_padded_seq,
+                                                                          int img_padded_seq,
+                                                                          int world_size,
+                                                                          int heads,
+                                                                          int head_dim) {
+    const int seq_total = txt_real_seq + img_real_seq;
+    const int qk_half_dim = head_dim / 2;
+    const int plane_elems = qk_half_dim * seq_total * heads;
+    const int txt_shard_seq = txt_padded_seq / world_size;
+    const int img_shard_seq = img_padded_seq / world_size;
+    const int total_head_dim = head_dim * 3;
+    const int txt_chunk = total_head_dim * heads * txt_shard_seq;
+    const int img_chunk = total_head_dim * heads * img_shard_seq;
+    const int count_per_peer = txt_chunk + img_chunk;
+    const int64_t total = static_cast<int64_t>(qk_half_dim) * seq_total * heads;
+
+    for (int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem = linear;
+        const int half = static_cast<int>(rem % qk_half_dim);
+        rem /= qk_half_dim;
+        const int tok = static_cast<int>(rem % seq_total);
+        rem /= seq_total;
+        const int head = static_cast<int>(rem);
+
+        const bool is_img = tok >= txt_real_seq;
+        const int src_t = is_img ? tok - txt_real_seq : tok;
+        const int stream_shard_seq = is_img ? img_shard_seq : txt_shard_seq;
+        const int peer = src_t / stream_shard_seq;
+        const int local_seq = src_t - peer * stream_shard_seq;
+        const int stream_offset = is_img ? txt_chunk : 0;
+        const int64_t src_base =
+            static_cast<int64_t>(peer) * count_per_peer +
+            stream_offset +
+            static_cast<int64_t>(head) * total_head_dim +
+            static_cast<int64_t>(local_seq) * total_head_dim * heads +
+            2 * half;
+        const half2 q_pair = *reinterpret_cast<const half2*>(recv_flat + src_base);
+        const half2 k_pair = *reinterpret_cast<const half2*>(recv_flat + src_base + head_dim);
+        const float2 q_float = __half22float2(q_pair);
+        const float2 k_float = __half22float2(k_pair);
+
+        const int64_t dst_base =
+            half +
+            static_cast<int64_t>(qk_half_dim) * (tok + seq_total * head);
+        dst[dst_base] = q_float.x;
+        dst[dst_base + plane_elems] = q_float.y;
+        dst[dst_base + 2 * plane_elems] = k_float.x;
+        dst[dst_base + 3 * plane_elems] = k_float.y;
+    }
+}
+
 static __global__ void qwen_fused_qk_pack_from_joint_recv_f32_quad_kernel(const float* __restrict__ recv_flat,
                                                                           float* __restrict__ dst,
                                                                           int txt_real_seq,
@@ -2928,6 +3151,94 @@ static __global__ void qwen_fused_v_pack_from_joint_recv_f32_kernel(const char* 
     }
 }
 
+static __global__ void qwen_fused_v_pack_from_joint_recv_f16_kernel(const half* __restrict__ recv_flat,
+                                                                    float* __restrict__ dst,
+                                                                    int64_t txt_real_seq,
+                                                                    int64_t img_real_seq,
+                                                                    int64_t txt_padded_seq,
+                                                                    int64_t img_padded_seq,
+                                                                    int64_t world_size,
+                                                                    int64_t heads,
+                                                                    int64_t head_dim) {
+    const int64_t seq_total = txt_real_seq + img_real_seq;
+    const int64_t total = head_dim * seq_total * heads;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem = linear;
+        const int64_t d = rem % head_dim;
+        rem /= head_dim;
+        const int64_t tok = rem % seq_total;
+        const int64_t head = rem / seq_total;
+        const bool is_txt = tok < txt_real_seq;
+        const int64_t src_t = is_txt ? tok : tok - txt_real_seq;
+        const int64_t src_d = 2 * head_dim + d;
+        const int64_t src_idx = qwen_joint_qkv_recv_src_index(src_d,
+                                                              src_t,
+                                                              head,
+                                                              is_txt ? 0 : 1,
+                                                              head_dim,
+                                                              heads,
+                                                              txt_padded_seq,
+                                                              img_padded_seq,
+                                                              world_size);
+        dst[linear] = __half2float(recv_flat[src_idx]);
+    }
+}
+
+static __global__ void qwen_fused_v_pack_from_joint_recv_f16_pair_kernel(const half* __restrict__ recv_flat,
+                                                                         float* __restrict__ dst,
+                                                                         int txt_real_seq,
+                                                                         int img_real_seq,
+                                                                         int txt_padded_seq,
+                                                                         int img_padded_seq,
+                                                                         int world_size,
+                                                                         int heads,
+                                                                         int head_dim) {
+    const int seq_total = txt_real_seq + img_real_seq;
+    const int half_dim = head_dim / 2;
+    const int txt_shard_seq = txt_padded_seq / world_size;
+    const int img_shard_seq = img_padded_seq / world_size;
+    const int total_head_dim = head_dim * 3;
+    const int txt_chunk = total_head_dim * heads * txt_shard_seq;
+    const int img_chunk = total_head_dim * heads * img_shard_seq;
+    const int count_per_peer = txt_chunk + img_chunk;
+    const int64_t total = static_cast<int64_t>(half_dim) * seq_total * heads;
+
+    for (int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem = linear;
+        const int half = static_cast<int>(rem % half_dim);
+        rem /= half_dim;
+        const int tok = static_cast<int>(rem % seq_total);
+        rem /= seq_total;
+        const int head = static_cast<int>(rem);
+
+        const bool is_img = tok >= txt_real_seq;
+        const int src_t = is_img ? tok - txt_real_seq : tok;
+        const int stream_shard_seq = is_img ? img_shard_seq : txt_shard_seq;
+        const int peer = src_t / stream_shard_seq;
+        const int local_seq = src_t - peer * stream_shard_seq;
+        const int stream_offset = is_img ? txt_chunk : 0;
+        const int d = 2 * half;
+        const int64_t src_base =
+            static_cast<int64_t>(peer) * count_per_peer +
+            stream_offset +
+            2 * head_dim +
+            d +
+            static_cast<int64_t>(head) * total_head_dim +
+            static_cast<int64_t>(local_seq) * total_head_dim * heads;
+        const float2 value = __half22float2(*reinterpret_cast<const half2*>(recv_flat + src_base));
+        const int64_t dst_base =
+            d +
+            static_cast<int64_t>(head_dim) * (tok + seq_total * head);
+        dst[dst_base] = value.x;
+        dst[dst_base + 1] = value.y;
+    }
+}
+
 static __global__ void qwen_fused_v_pack_from_joint_recv_f32_vec4_kernel(const float* __restrict__ recv_flat,
                                                                          float* __restrict__ dst,
                                                                          int txt_real_seq,
@@ -2988,6 +3299,42 @@ void ggml_cuda_op_qwen_fused_qkv_pack(ggml_backend_cuda_context& ctx, ggml_tenso
 
     if (qwen_params->mode == 42) {
         GGML_ASSERT(dst->src[0] != nullptr);
+        return;
+    }
+
+    if (qwen_params->mode == 52) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F16);
+        const ggml_tensor* src = dst->src[0];
+        GGML_ASSERT(src != nullptr);
+        GGML_ASSERT(src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_nelements(src) == ggml_nelements(dst));
+        GGML_ASSERT(ggml_is_contiguous(src));
+        GGML_ASSERT(ggml_is_contiguous(dst));
+
+        const int64_t total = ggml_nelements(dst);
+        const int threads = 256;
+        const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
+        cudaStream_t stream = ctx.stream();
+        cudaEvent_t profile_start = nullptr;
+        cudaEvent_t profile_stop = nullptr;
+        const bool profile = ggml_cuda_qwen_fused_profile_begin(stream, &profile_start, &profile_stop);
+        if (src->type == GGML_TYPE_F32) {
+            qwen_fused_scale_f32_to_f16_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<const float*>(src->data),
+                static_cast<half*>(dst->data),
+                qwen_params->scale,
+                total);
+        } else {
+            qwen_fused_scale_f16_to_f16_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<const half*>(src->data),
+                static_cast<half*>(dst->data),
+                qwen_params->scale,
+                total);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        if (profile) {
+            ggml_cuda_qwen_fused_profile_end(stream, profile_start, profile_stop, qwen_params->mode, dst);
+        }
         return;
     }
 
@@ -3436,9 +3783,21 @@ void ggml_cuda_op_qwen_fused_qkv_pack(ggml_backend_cuda_context& ctx, ggml_tenso
         GGML_ASSERT(attn->ne[2] == qwen_params->txt_real_seq + qwen_params->img_real_seq);
         GGML_ASSERT(attn->ne[3] == 1);
 
-        const bool use_h2 = attn->type == GGML_TYPE_F16 &&
-                            attn->nb[0] == sizeof(half) &&
-                            (attn->ne[0] % 2) == 0;
+        const bool use_f16_h2 = attn->type == GGML_TYPE_F16 &&
+                                attn->nb[0] == sizeof(half) &&
+                                (attn->ne[0] % 2) == 0 &&
+                                ggml_cuda_qwen_ptr_aligned(attn->data, alignof(half2)) &&
+                                ggml_cuda_qwen_ptr_aligned(dst->data, alignof(half2)) &&
+                                (attn->nb[1] % alignof(half2)) == 0 &&
+                                (attn->nb[2] % alignof(half2)) == 0;
+        const bool use_f32_to_f16_h2 = attn->type == GGML_TYPE_F32 &&
+                                       attn->nb[0] == sizeof(float) &&
+                                       (attn->ne[0] % 2) == 0 &&
+                                       ggml_cuda_qwen_ptr_aligned(attn->data, alignof(float2)) &&
+                                       ggml_cuda_qwen_ptr_aligned(dst->data, alignof(half2)) &&
+                                       (attn->nb[1] % alignof(float2)) == 0 &&
+                                       (attn->nb[2] % alignof(float2)) == 0;
+        const bool use_h2 = use_f16_h2 || use_f32_to_f16_h2;
         const int64_t total = use_h2 ? ggml_nelements(dst) / 2 : ggml_nelements(dst);
         const int threads = 256;
         const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
@@ -3446,8 +3805,20 @@ void ggml_cuda_op_qwen_fused_qkv_pack(ggml_backend_cuda_context& ctx, ggml_tenso
         cudaEvent_t profile_start = nullptr;
         cudaEvent_t profile_stop = nullptr;
         const bool profile = ggml_cuda_qwen_fused_profile_begin(stream, &profile_start, &profile_stop);
-        if (use_h2) {
+        if (use_f16_h2) {
             qwen_fused_attn_head_to_seq_send_pack_f16_h2_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<const char*>(attn->data),
+                reinterpret_cast<half2*>(dst->data),
+                qwen_params->txt_real_seq,
+                qwen_params->img_real_seq,
+                qwen_params->txt_padded_seq,
+                qwen_params->img_padded_seq,
+                qwen_params->world_size,
+                attn->ne[0],
+                attn->ne[1],
+                attn->nb[0], attn->nb[1], attn->nb[2], attn->nb[3]);
+        } else if (use_f32_to_f16_h2) {
+            qwen_fused_attn_head_to_seq_send_pack_f32_to_f16_h2_kernel<<<blocks, threads, 0, stream>>>(
                 static_cast<const char*>(attn->data),
                 reinterpret_cast<half2*>(dst->data),
                 qwen_params->txt_real_seq,
@@ -3491,22 +3862,39 @@ void ggml_cuda_op_qwen_fused_qkv_pack(ggml_backend_cuda_context& ctx, ggml_tenso
         GGML_ASSERT(qwen_params->img_padded_seq % qwen_params->world_size == 0);
         GGML_ASSERT(dst->ne[1] % qwen_params->world_size == 0);
 
-        const int64_t total = ggml_nelements(dst);
+        const bool use_h2 =
+            (dst->ne[0] % 2) == 0 &&
+            (dst->nb[0] == sizeof(float)) &&
+            ggml_cuda_qwen_ptr_aligned(recv_flat->data, alignof(half2)) &&
+            ggml_cuda_qwen_ptr_aligned(dst->data, alignof(float2));
+        const int64_t total = use_h2 ? ggml_nelements(dst) / 2 : ggml_nelements(dst);
         const int threads = 256;
         const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
         cudaStream_t stream = ctx.stream();
         cudaEvent_t profile_start = nullptr;
         cudaEvent_t profile_stop = nullptr;
         const bool profile = ggml_cuda_qwen_fused_profile_begin(stream, &profile_start, &profile_stop);
-        qwen_fused_attn_head_to_seq_recv_unpack_f16_kernel<<<blocks, threads, 0, stream>>>(
-            static_cast<const half*>(recv_flat->data),
-            static_cast<float*>(dst->data),
-            qwen_params->stream_index,
-            qwen_params->txt_padded_seq,
-            qwen_params->img_padded_seq,
-            qwen_params->world_size,
-            dst->ne[0],
-            dst->ne[1]);
+        if (use_h2) {
+            qwen_fused_attn_head_to_seq_recv_unpack_f16_h2_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<const half*>(recv_flat->data),
+                static_cast<float*>(dst->data),
+                qwen_params->stream_index,
+                qwen_params->txt_padded_seq,
+                qwen_params->img_padded_seq,
+                qwen_params->world_size,
+                dst->ne[0],
+                dst->ne[1]);
+        } else {
+            qwen_fused_attn_head_to_seq_recv_unpack_f16_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<const half*>(recv_flat->data),
+                static_cast<float*>(dst->data),
+                qwen_params->stream_index,
+                qwen_params->txt_padded_seq,
+                qwen_params->img_padded_seq,
+                qwen_params->world_size,
+                dst->ne[0],
+                dst->ne[1]);
+        }
         CUDA_CHECK(cudaGetLastError());
         if (profile) {
             ggml_cuda_qwen_fused_profile_end(stream, profile_start, profile_stop, qwen_params->mode, dst);
@@ -4102,7 +4490,7 @@ void ggml_cuda_op_qwen_fused_qkv_pack(ggml_backend_cuda_context& ctx, ggml_tenso
         GGML_ASSERT(dst->type == GGML_TYPE_F32);
         const ggml_tensor* recv_flat = dst->src[0];
         GGML_ASSERT(recv_flat);
-        GGML_ASSERT(recv_flat->type == GGML_TYPE_F32);
+        GGML_ASSERT(recv_flat->type == GGML_TYPE_F32 || recv_flat->type == GGML_TYPE_F16);
         GGML_ASSERT(qwen_params->txt_real_seq > 0 && qwen_params->img_real_seq > 0);
         GGML_ASSERT(qwen_params->txt_padded_seq >= qwen_params->txt_real_seq);
         GGML_ASSERT(qwen_params->img_padded_seq >= qwen_params->img_real_seq);
@@ -4140,6 +4528,7 @@ void ggml_cuda_op_qwen_fused_qkv_pack(ggml_backend_cuda_context& ctx, ggml_tenso
             total <= max_i32;
         if (qwen_params->mode == 50) {
             const bool use_quad =
+                recv_flat->type == GGML_TYPE_F32 &&
                 use_i32 &&
                 (head_dim % 2) == 0 &&
                 (dst->nb[0] == sizeof(float)) &&
@@ -4159,19 +4548,53 @@ void ggml_cuda_op_qwen_fused_qkv_pack(ggml_backend_cuda_context& ctx, ggml_tenso
                     static_cast<int>(heads),
                     static_cast<int>(head_dim));
             } else {
-                qwen_fused_qk_pack_from_joint_recv_f32_kernel<<<blocks, threads, 0, stream>>>(
-                    static_cast<const char*>(recv_flat->data),
-                    static_cast<float*>(dst->data),
-                    qwen_params->txt_real_seq,
-                    qwen_params->img_real_seq,
-                    qwen_params->txt_padded_seq,
-                    qwen_params->img_padded_seq,
-                    qwen_params->world_size,
-                    heads,
-                    head_dim);
+                if (recv_flat->type == GGML_TYPE_F16) {
+                    const bool use_pair =
+                        use_i32 &&
+                        (head_dim % 2) == 0 &&
+                        (dst->nb[0] == sizeof(float)) &&
+                        ggml_cuda_qwen_ptr_aligned(recv_flat->data, alignof(half2));
+                    if (use_pair) {
+                        const int64_t pair_total = (head_dim / 2) * (qwen_params->txt_real_seq + qwen_params->img_real_seq) * heads;
+                        const int pair_blocks = static_cast<int>(std::min<int64_t>((pair_total + threads - 1) / threads, 65535));
+                        qwen_fused_qk_pack_from_joint_recv_f16_pair_kernel<<<pair_blocks, threads, 0, stream>>>(
+                            static_cast<const half*>(recv_flat->data),
+                            static_cast<float*>(dst->data),
+                            static_cast<int>(qwen_params->txt_real_seq),
+                            static_cast<int>(qwen_params->img_real_seq),
+                            static_cast<int>(qwen_params->txt_padded_seq),
+                            static_cast<int>(qwen_params->img_padded_seq),
+                            static_cast<int>(qwen_params->world_size),
+                            static_cast<int>(heads),
+                            static_cast<int>(head_dim));
+                    } else {
+                        qwen_fused_qk_pack_from_joint_recv_f16_kernel<<<blocks, threads, 0, stream>>>(
+                            static_cast<const half*>(recv_flat->data),
+                            static_cast<float*>(dst->data),
+                            qwen_params->txt_real_seq,
+                            qwen_params->img_real_seq,
+                            qwen_params->txt_padded_seq,
+                            qwen_params->img_padded_seq,
+                            qwen_params->world_size,
+                            heads,
+                            head_dim);
+                    }
+                } else {
+                    qwen_fused_qk_pack_from_joint_recv_f32_kernel<<<blocks, threads, 0, stream>>>(
+                        static_cast<const char*>(recv_flat->data),
+                        static_cast<float*>(dst->data),
+                        qwen_params->txt_real_seq,
+                        qwen_params->img_real_seq,
+                        qwen_params->txt_padded_seq,
+                        qwen_params->img_padded_seq,
+                        qwen_params->world_size,
+                        heads,
+                        head_dim);
+                }
             }
         } else {
             const bool use_vec4 =
+                recv_flat->type == GGML_TYPE_F32 &&
                 use_i32 &&
                 (head_dim % 4) == 0 &&
                 (dst->nb[0] == sizeof(float)) &&
@@ -4191,16 +4614,49 @@ void ggml_cuda_op_qwen_fused_qkv_pack(ggml_backend_cuda_context& ctx, ggml_tenso
                     static_cast<int>(heads),
                     static_cast<int>(head_dim));
             } else {
-                qwen_fused_v_pack_from_joint_recv_f32_kernel<<<blocks, threads, 0, stream>>>(
-                    static_cast<const char*>(recv_flat->data),
-                    static_cast<float*>(dst->data),
-                    qwen_params->txt_real_seq,
-                    qwen_params->img_real_seq,
-                    qwen_params->txt_padded_seq,
-                    qwen_params->img_padded_seq,
-                    qwen_params->world_size,
-                    heads,
-                    head_dim);
+                if (recv_flat->type == GGML_TYPE_F16) {
+                    const bool use_pair =
+                        use_i32 &&
+                        (head_dim % 2) == 0 &&
+                        (dst->nb[0] == sizeof(float)) &&
+                        ggml_cuda_qwen_ptr_aligned(recv_flat->data, alignof(half2));
+                    if (use_pair) {
+                        const int64_t pair_total = (head_dim / 2) * (qwen_params->txt_real_seq + qwen_params->img_real_seq) * heads;
+                        const int pair_blocks = static_cast<int>(std::min<int64_t>((pair_total + threads - 1) / threads, 65535));
+                        qwen_fused_v_pack_from_joint_recv_f16_pair_kernel<<<pair_blocks, threads, 0, stream>>>(
+                            static_cast<const half*>(recv_flat->data),
+                            static_cast<float*>(dst->data),
+                            static_cast<int>(qwen_params->txt_real_seq),
+                            static_cast<int>(qwen_params->img_real_seq),
+                            static_cast<int>(qwen_params->txt_padded_seq),
+                            static_cast<int>(qwen_params->img_padded_seq),
+                            static_cast<int>(qwen_params->world_size),
+                            static_cast<int>(heads),
+                            static_cast<int>(head_dim));
+                    } else {
+                        qwen_fused_v_pack_from_joint_recv_f16_kernel<<<blocks, threads, 0, stream>>>(
+                            static_cast<const half*>(recv_flat->data),
+                            static_cast<float*>(dst->data),
+                            qwen_params->txt_real_seq,
+                            qwen_params->img_real_seq,
+                            qwen_params->txt_padded_seq,
+                            qwen_params->img_padded_seq,
+                            qwen_params->world_size,
+                            heads,
+                            head_dim);
+                    }
+                } else {
+                    qwen_fused_v_pack_from_joint_recv_f32_kernel<<<blocks, threads, 0, stream>>>(
+                        static_cast<const char*>(recv_flat->data),
+                        static_cast<float*>(dst->data),
+                        qwen_params->txt_real_seq,
+                        qwen_params->img_real_seq,
+                        qwen_params->txt_padded_seq,
+                        qwen_params->img_padded_seq,
+                        qwen_params->world_size,
+                        heads,
+                        head_dim);
+                }
             }
         }
         CUDA_CHECK(cudaGetLastError());

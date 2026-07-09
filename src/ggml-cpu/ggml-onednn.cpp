@@ -184,12 +184,20 @@ extern "C" bool ed_onednn_sgemm_bf16(int64_t n, int64_t m, int64_t k,
                 Entry ent;
                 ent.m = m; ent.n = n; ent.k = k;
 
-                // src/dst plain (explicit strides) so they never need reorder.
-                // weights `any` so oneDNN picks the AMX-optimal packed layout.
+                // src/dst plain (explicit strides). Weights default to plain `ba`
+                // (column-major, matching ggml's stored [n,k]) fed DIRECTLY with no
+                // reorder — exactly what PyTorch/diffusers does. Diffusion/T5 weights are
+                // used once per forward, so oneDNN's AMX weight-pack (format_tag::any)
+                // never amortizes: the per-call reorder was pure overhead (T5 text-encode
+                // 2.28s->1.38s, DiT matmul 7459->9999 GFLOP/s once removed). Set
+                // ED_ONEDNN_PACK to restore the packed path for weights reused many times.
+                const bool nopack = getenv("ED_ONEDNN_PACK") == nullptr;
                 memory::desc a_md({m, k}, dt::bf16, memory::dims{ldb_elems, 1});
-                memory::desc b_any({k, n}, dt::bf16, tag::any);
+                memory::desc b_desc = nopack
+                    ? memory::desc({k, n}, dt::bf16, memory::dims{1, lda_elems})  // plain ba, no reorder
+                    : memory::desc({k, n}, dt::bf16, tag::any);
                 memory::desc c_md({m, n}, dt::f32,  memory::dims{ldc_elems, 1});
-                ent.pd = matmul::primitive_desc(eng, a_md, b_any, c_md);
+                ent.pd = matmul::primitive_desc(eng, a_md, b_desc, c_md);
                 ent.prim = matmul(ent.pd);
 
                 // Build src/dst memory objects ONCE; the hot path only swaps handles.
@@ -201,10 +209,11 @@ extern "C" bool ed_onednn_sgemm_bf16(int64_t n, int64_t m, int64_t k,
                 e = &res.first->second;
             }
 
-            // Level 1: packed weights, independent of m. Reorder ONCE per (ptr,n,k),
-            // reusing the packed layout the primitive wants. m varies constantly
-            // (token counts, conv patch tiles); keying the reorder on m re-packed the
-            // same weight every shape change (~1.3s/step wasted). Pack keyed on (ptr,n,k).
+            // Level 1: packed weights. Skipped by default (weight fed directly in plain
+            // ba layout, like diffusers — no reorder). ED_ONEDNN_PACK restores packing.
+            if (getenv("ED_ONEDNN_PACK") == nullptr) {
+                b_packed = nullptr;  // sentinel: use src0 directly below
+            } else {
             auto wit = c.wpack.find(src0_bf16);
             if (wit != c.wpack.end() && wit->second.valid &&
                 wit->second.n == n && wit->second.k == k) {
@@ -221,15 +230,24 @@ extern "C" bool ed_onednn_sgemm_bf16(int64_t n, int64_t m, int64_t k,
                 auto wres = c.wpack.insert_or_assign(src0_bf16, std::move(wp));
                 b_packed = &wres.first->second.b_packed;
             }
+            }
         }
 
         // Hot path: reuse cached memory objects, only swap the data handles.
         e->a_mem.set_data_handle(const_cast<void*>(act_bf16));
         e->c_mem.set_data_handle(dst_f32);
 
-        e->prim.execute(s, {{DNNL_ARG_SRC, e->a_mem},
-                            {DNNL_ARG_WEIGHTS, *b_packed},
-                            {DNNL_ARG_DST, e->c_mem}});
+        if (b_packed == nullptr) {
+            // NOPACK: weight fed directly in plain ba layout (no reorder), like diffusers.
+            memory w_direct(e->pd.weights_desc(), eng, const_cast<void*>(src0_bf16));
+            e->prim.execute(s, {{DNNL_ARG_SRC, e->a_mem},
+                                {DNNL_ARG_WEIGHTS, w_direct},
+                                {DNNL_ARG_DST, e->c_mem}});
+        } else {
+            e->prim.execute(s, {{DNNL_ARG_SRC, e->a_mem},
+                                {DNNL_ARG_WEIGHTS, *b_packed},
+                                {DNNL_ARG_DST, e->c_mem}});
+        }
         s.wait();
         return true;
     } catch (const dnnl::error&) {

@@ -20,7 +20,11 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#endif
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -128,6 +132,29 @@ stream& get_stream() {
     return s;
 }
 
+// Per-M concurrency. oneDNN bakes bgmmc.nthr from get_max_threads() at PRIMITIVE
+// CREATION time and parallelizes over output (M,N) blocks. When BOTH M and N are
+// small there aren't enough output tiles to feed 192 threads, so each thread's tile
+// is tiny and sync dominates: M=256,N<=4096 runs ~1000-1300 GFLOP/s at 192 threads
+// but 3300-3600 at 24 threads (same N/K). A large N alone provides enough N-blocks
+// (M=256,N=12288 is already fast at 192), so only cap when N is also small.
+// A large K is also enough reduction work to feed many threads: M=256,N=3072,K=12288
+// (mlp_out) capped to 24 runs 5204 GFLOP/s but its mirror N=12288,K=3072 (same FLOP)
+// at 192 hits 9238 — so DON'T cap when K is large either.
+// Measured per-shape (real Flux flow): cap helps every M=256,N<=8192,K<=8192 matmul
+// (T5 proj + DiT txt qkv/proj) 1.7-3.8x; capping large-N or large-K M=256 REGRESSES.
+// ED_MM_NTHR_SMALL overrides the capped thread count (0 = disable, use full).
+int ed_pick_nthr(int64_t m, int64_t n, int64_t k, int full) {
+    static int small = -2;
+    if (small == -2) {
+        const char* env = getenv("ED_MM_NTHR_SMALL");
+        small = env ? atoi(env) : 24;   // default: cap small-tile matmuls at 24
+    }
+    if (small <= 0) return full;               // disabled
+    if (m <= 512 && n <= 8192 && k <= 8192) return std::min(full, small);
+    return full;
+}
+
 // Two-level cache. The packed weight layout depends only on (weight ptr, n, k) —
 // NOT on m (the activation/token count). m varies constantly (per token count, per
 // conv patch tile), so keying the weight reorder on m re-packed the same weight on
@@ -144,6 +171,7 @@ struct Entry {
     matmul prim;
     memory a_mem;   // src, data handle swapped per call
     memory c_mem;   // dst, data handle swapped per call
+    int nthr = 0;   // concurrency baked at creation (per-M tuned)
     bool valid = false;
 };
 struct Cache {
@@ -197,8 +225,14 @@ extern "C" bool ed_onednn_sgemm_bf16(int64_t n, int64_t m, int64_t k,
                     ? memory::desc({k, n}, dt::bf16, memory::dims{1, lda_elems})  // plain ba, no reorder
                     : memory::desc({k, n}, dt::bf16, tag::any);
                 memory::desc c_md({m, n}, dt::f32,  memory::dims{ldc_elems, 1});
+                // Bake per-M concurrency into the primitive (oneDNN reads
+                // get_max_threads() here). Small M -> fewer threads to avoid
+                // over-splitting; restore full afterward so other prims are unaffected.
+                ent.nthr = ed_pick_nthr(m, n, k, get_tp().get_num_threads());
+                dnnl_threadpool_interop_set_max_concurrency(ent.nthr);
                 ent.pd = matmul::primitive_desc(eng, a_md, b_desc, c_md);
                 ent.prim = matmul(ent.pd);
+                dnnl_threadpool_interop_set_max_concurrency(get_tp().get_num_threads());
 
                 // Build src/dst memory objects ONCE; the hot path only swaps handles.
                 ent.a_mem = memory(ent.pd.src_desc(), eng, const_cast<void*>(act_bf16));
@@ -399,6 +433,9 @@ extern "C" bool ed_onednn_conv2d_bf16(int64_t N, int64_t IC, int64_t IH, int64_t
 // ---------------------------------------------------------------------------
 #include <cmath>
 #include <cstring>
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#endif
 
 #ifdef DNNL_EXPERIMENTAL_UKERNEL
 namespace {
@@ -419,6 +456,83 @@ inline float ed_ld(const void* base, int type, int64_t idx){
     float r; std::memcpy(&r,&f,4); return r;
 }
 inline uint16_t ed_f2bf16(float f){ uint32_t u; std::memcpy(&u,&f,4); return (uint16_t)((u + 0x7fff + ((u>>16)&1)) >> 16); }
+
+#if defined(__AVX512F__)
+// AVX-512 exp (same minimax poly as ggml's ggml_v_expf; ~1e-6 rel err over the
+// softmax range). Used to vectorize the flash softmax exp — the dominant scalar
+// cost (57% of flash time). Mirrors ATen's vectorized CPU flash softmax.
+inline __m512 ed_v_expf(__m512 x) {
+    const __m512 r   = _mm512_set1_ps(0x1.8p23f);
+    const __m512 z   = _mm512_fmadd_ps(x, _mm512_set1_ps(0x1.715476p+0f), r);
+    const __m512 n   = _mm512_sub_ps(z, r);
+    const __m512 b   = _mm512_fnmadd_ps(n, _mm512_set1_ps(0x1.7f7d1cp-20f),
+                       _mm512_fnmadd_ps(n, _mm512_set1_ps(0x1.62e4p-1f), x));
+    const __m512i e  = _mm512_slli_epi32(_mm512_castps_si512(z), 23);
+    const __m512 k   = _mm512_castsi512_ps(_mm512_add_epi32(e, _mm512_castps_si512(_mm512_set1_ps(1))));
+    const __mmask16 c = _mm512_cmp_ps_mask(_mm512_abs_ps(n), _mm512_set1_ps(126), _CMP_GT_OQ);
+    const __m512 u   = _mm512_mul_ps(b, b);
+    const __m512 j   = _mm512_fmadd_ps(
+        _mm512_fmadd_ps(_mm512_fmadd_ps(_mm512_set1_ps(0x1.573e2ep-5f), b, _mm512_set1_ps(0x1.555b98p-3f)), u,
+                        _mm512_fmadd_ps(_mm512_set1_ps(0x1.fffdb6p-2f), b, _mm512_set1_ps(0x1.ffffecp-1f))),
+        b, _mm512_set1_ps(1));
+    if (_mm512_kortestz(c, c)) return _mm512_fmadd_ps(j, k, k);
+    const __m512i g = _mm512_and_si512(_mm512_movm_epi32(_mm512_cmp_ps_mask(n, _mm512_setzero_ps(), _CMP_LE_OQ)),
+                                       _mm512_set1_epi32(0x82000000u));
+    const __m512 s1 = _mm512_castsi512_ps(_mm512_add_epi32(g, _mm512_set1_epi32(0x7f000000u)));
+    const __m512 s2 = _mm512_castsi512_ps(_mm512_sub_epi32(_mm512_castps_si512(k), g));
+    const __mmask16 d = _mm512_cmp_ps_mask(_mm512_abs_ps(n), _mm512_set1_ps(192), _CMP_GT_OQ);
+    return _mm512_mask_blend_ps(d,
+        _mm512_mask_blend_ps(c, _mm512_fmadd_ps(k, j, k), _mm512_mul_ps(_mm512_fmadd_ps(s2, j, s2), s1)),
+        _mm512_mul_ps(s1, s1));
+}
+// Fused: for row srow[0..kn), compute p=exp((srow*scale)-mcur), store bf16 into
+// pbf[0..kvBlk), return sum(p). Scalar tail for kn%16.
+inline float ed_softmax_pack_row(const float* srow, float scale, float mcur,
+                                 uint16_t* pbf, int64_t kn, int64_t kvBlk) {
+    int64_t j = 0;
+    __m512 vsum = _mm512_setzero_ps();
+    const __m512 vscale = _mm512_set1_ps(scale), vmcur = _mm512_set1_ps(mcur);
+    for (; j + 16 <= kn; j += 16) {
+        __m512 s = _mm512_mul_ps(_mm512_loadu_ps(srow + j), vscale);
+        __m512 p = ed_v_expf(_mm512_sub_ps(s, vmcur));
+        vsum = _mm512_add_ps(vsum, p);
+        // f32 -> bf16 (round-to-nearest-even), store 16 x uint16
+        __m512i u = _mm512_castps_si512(p);
+        __m512i r = _mm512_add_epi32(_mm512_add_epi32(u, _mm512_set1_epi32(0x7fff)),
+                                     _mm512_and_epi32(_mm512_srli_epi32(u, 16), _mm512_set1_epi32(1)));
+        _mm256_storeu_si256((__m256i*)(pbf + j), _mm512_cvtepi32_epi16(_mm512_srli_epi32(r, 16)));
+    }
+    float sum = _mm512_reduce_add_ps(vsum);
+    for (; j < kn; ++j) { float p = std::exp(srow[j]*scale - mcur); pbf[j] = ed_f2bf16(p); sum += p; }
+    for (int64_t t = kn; t < kvBlk; ++t) pbf[t] = 0;
+    return sum;
+}
+// Vectorized row convert: d contiguous elements (f32 or f16) -> bf16 out[0..d).
+// f16 uses the F16C hardware cvt; f32 packs directly. Falls back to scalar tail.
+inline void ed_row_to_bf16(const void* src, int type, uint16_t* out, int64_t d) {
+    int64_t dd = 0;
+    if (type == 0) {  // f32
+        const float* s = (const float*)src;
+        for (; dd + 16 <= d; dd += 16) {
+            __m512i u = _mm512_castps_si512(_mm512_loadu_ps(s + dd));
+            __m512i r = _mm512_add_epi32(_mm512_add_epi32(u, _mm512_set1_epi32(0x7fff)),
+                                         _mm512_and_epi32(_mm512_srli_epi32(u,16), _mm512_set1_epi32(1)));
+            _mm256_storeu_si256((__m256i*)(out+dd), _mm512_cvtepi32_epi16(_mm512_srli_epi32(r,16)));
+        }
+    } else {  // f16
+        const uint16_t* s = (const uint16_t*)src;
+        for (; dd + 16 <= d; dd += 16) {
+            __m512 f = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i*)(s+dd)));  // F16C
+            __m512i u = _mm512_castps_si512(f);
+            __m512i r = _mm512_add_epi32(_mm512_add_epi32(u, _mm512_set1_epi32(0x7fff)),
+                                         _mm512_and_epi32(_mm512_srli_epi32(u,16), _mm512_set1_epi32(1)));
+            _mm256_storeu_si256((__m256i*)(out+dd), _mm512_cvtepi32_epi16(_mm512_srli_epi32(r,16)));
+        }
+    }
+    for (; dd < d; ++dd) out[dd] = ed_f2bf16(ed_ld(src, type, dd));
+}
+#endif
+
 
 // Per-thread cached brgemm kernels + packing (shapes fixed per call site; qBlk/kvBlk const).
 struct FlashKernels {
@@ -482,7 +596,11 @@ extern "C" bool ed_onednn_flash_attn_bf16(
             // ---- load & bf16-pack Q block: Qb[qn, d] ----
             for (int64_t i=0;i<qn;++i){
                 const void* qrow_base = (const char*)q + (size_t)(b*qb3 + h*qb2 + (q0+i)*qb1)*(q_type==0?4:2);
+#if defined(__AVX512F__)
+                ed_row_to_bf16(qrow_base, q_type, &Qb[(size_t)i*d_head], d_head);
+#else
                 for (int64_t dd=0; dd<d_head; ++dd) Qb[(size_t)i*d_head+dd] = ed_f2bf16(ed_ld(qrow_base,q_type,dd));
+#endif
             }
             for (int64_t i=0;i<qn;++i){ m_i[i]=-1e30f; l_i[i]=0; }
             std::fill(acc.begin(), acc.begin()+(size_t)qn*d_head, 0.0f);
@@ -497,10 +615,15 @@ extern "C" bool ed_onednn_flash_attn_bf16(
                 for (int64_t j=0;j<kn;++j){
                     const void* krow = (const char*)k + (size_t)(b*kb3 + hk*kb2 + (k0+j)*kb1)*(k_type==0?4:2);
                     const void* vrow = (const char*)v + (size_t)(b*vb3 + hk*vb2 + (k0+j)*vb1)*(v_type==0?4:2);
+#if defined(__AVX512F__)
+                    ed_row_to_bf16(krow, k_type, &Kraw[(size_t)j*d_head], d_head);
+                    ed_row_to_bf16(vrow, v_type, &Vraw[(size_t)j*d_head], d_head);
+#else
                     for (int64_t dd=0; dd<d_head; ++dd){
                         Kraw[(size_t)j*d_head + dd] = ed_f2bf16(ed_ld(krow,k_type,dd)); // [kv,d]
                         Vraw[(size_t)j*d_head + dd] = ed_f2bf16(ed_ld(vrow,v_type,dd)); // [kv,d]
                     }
+#endif
                 }
                 g_fk.packKT.execute(Kraw.data(), KTp.data());  // trans: [kv,d] -> packed [d,kvBlk]
                 g_fk.packV.execute(Vraw.data(),  Vp.data());   // no_trans: [kv,d] packed
@@ -510,10 +633,22 @@ extern "C" bool ed_onednn_flash_attn_bf16(
                 for (int64_t i=0;i<qn;++i){
                     float* srow = &S[(size_t)i*kvBlk];
                     float mprev=m_i[i], mcur=mprev;
+#if defined(__AVX512F__)
+                    // vectorized max of (srow*scale) over [0,kn)
+                    {
+                        int64_t j=0; __m512 vmax=_mm512_set1_ps(mcur); const __m512 vs=_mm512_set1_ps(scale);
+                        for (; j+16<=kn; j+=16) vmax=_mm512_max_ps(vmax,_mm512_mul_ps(_mm512_loadu_ps(srow+j),vs));
+                        mcur=_mm512_reduce_max_ps(vmax);
+                        for (; j<kn; ++j){ float v=srow[j]*scale; if(v>mcur)mcur=v; }
+                    }
+                    float alpha = std::exp(mprev-mcur);
+                    float lsum = ed_softmax_pack_row(srow, scale, mcur, &Pb[(size_t)i*kvBlk], kn, kvBlk);
+#else
                     for (int64_t j=0;j<kn;++j){ srow[j]*=scale; if(srow[j]>mcur)mcur=srow[j]; }
                     float alpha = std::exp(mprev-mcur), lsum=0;
                     for (int64_t j=0;j<kn;++j){ float p=std::exp(srow[j]-mcur); Pb[(size_t)i*kvBlk+j]=ed_f2bf16(p); lsum+=p; }
                     for (int64_t j=kn;j<kvBlk;++j) Pb[(size_t)i*kvBlk+j]=0;  // zero pad
+#endif
                     float* arow=&acc[(size_t)i*d_head]; for(int64_t dd=0;dd<d_head;++dd) arow[dd]*=alpha;
                     l_i[i]=l_i[i]*alpha+lsum; m_i[i]=mcur;
                 }

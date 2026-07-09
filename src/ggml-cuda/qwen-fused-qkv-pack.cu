@@ -50,6 +50,7 @@ static bool ggml_cuda_qwen_fused_qkv_pack_name_matches(const ggml_tensor* dst) {
            std::strstr(name, "_fused_attn") != nullptr ||
            std::strstr(name, "_attn_head_to_seq") != nullptr ||
            std::strstr(name, "_qkv_seq_to_head") != nullptr ||
+           std::strstr(name, "_q_attn_in") != nullptr ||
            std::strstr(name, "_kv_attn_in") != nullptr ||
            std::strstr(name, "_q_rope") != nullptr ||
            std::strstr(name, "_k_rope") != nullptr;
@@ -69,6 +70,36 @@ static bool ggml_cuda_qwen_fused_profile_enabled() {
 static bool ggml_cuda_flux_sp_fast_qkv_send_pack_f16_enabled() {
     static const bool enabled = [] {
         const char* env = std::getenv("ED_FLUX_SP_FAST_QKV_SEND_PACK_F16");
+        if (env == nullptr || env[0] == '\0') {
+            return true;
+        }
+        return std::strcmp(env, "0") != 0 &&
+               std::strcmp(env, "false") != 0 &&
+               std::strcmp(env, "FALSE") != 0 &&
+               std::strcmp(env, "off") != 0 &&
+               std::strcmp(env, "OFF") != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_wan_sp_triplet_qkv_send_pack_enabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("ED_WAN_SP_TRIPLET_QKV_SEND_PACK");
+        if (env == nullptr || env[0] == '\0') {
+            return true;
+        }
+        return std::strcmp(env, "0") != 0 &&
+               std::strcmp(env, "false") != 0 &&
+               std::strcmp(env, "FALSE") != 0 &&
+               std::strcmp(env, "off") != 0 &&
+               std::strcmp(env, "OFF") != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_wan_sp_vec2_recv_unpack_enabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("ED_WAN_SP_VEC2_RECV_UNPACK");
         if (env == nullptr || env[0] == '\0') {
             return true;
         }
@@ -167,6 +198,16 @@ static const char* ggml_cuda_qwen_fused_profile_mode_detail(int64_t mode) {
             return "wan_qkv_vhalf_send_pack";
         case 37:
             return "wan_qkv_roped_half_send_pack";
+        case 56:
+            return "wan_qkv_roped_all_half_send_pack";
+        case 57:
+            return "wan_roped_all_half_q_recv_unpack";
+        case 58:
+            return "wan_roped_all_half_kv_recv_unpack";
+        case 59:
+            return "wan_head_to_seq_send_pack_f16";
+        case 60:
+            return "wan_head_to_seq_recv_unpack_f16";
         default:
             return "other";
     }
@@ -1634,6 +1675,46 @@ static __device__ __forceinline__ float wan_roped_local_value(const char* __rest
     return __fadd_rn(__fmul_rn(x0, pe0), __fmul_rn(x1, pe1));
 }
 
+static __device__ __forceinline__ uint32_t wan_roped_pair_to_half2_bits(const char* __restrict__ x,
+                                                                        const char* __restrict__ pe,
+                                                                        int64_t half,
+                                                                        int64_t head,
+                                                                        int64_t local_seq,
+                                                                        int64_t global_seq,
+                                                                        size_t x_nb0,
+                                                                        size_t x_nb1,
+                                                                        size_t x_nb2,
+                                                                        size_t x_nb3,
+                                                                        size_t pe_nb0,
+                                                                        size_t pe_nb1,
+                                                                        size_t pe_nb2,
+                                                                        size_t pe_nb3) {
+    const float x0 = *reinterpret_cast<const float*>(x + (2 * half) * x_nb0 + head * x_nb1 + local_seq * x_nb2 + 0 * x_nb3);
+    const float x1 = *reinterpret_cast<const float*>(x + (2 * half + 1) * x_nb0 + head * x_nb1 + local_seq * x_nb2 + 0 * x_nb3);
+    const float pe00 = *reinterpret_cast<const float*>(pe + 0 * pe_nb0 + half * pe_nb1 + global_seq * pe_nb2 + 0 * pe_nb3);
+    const float pe01 = *reinterpret_cast<const float*>(pe + 0 * pe_nb0 + half * pe_nb1 + global_seq * pe_nb2 + 1 * pe_nb3);
+    const float pe10 = *reinterpret_cast<const float*>(pe + 1 * pe_nb0 + half * pe_nb1 + global_seq * pe_nb2 + 0 * pe_nb3);
+    const float pe11 = *reinterpret_cast<const float*>(pe + 1 * pe_nb0 + half * pe_nb1 + global_seq * pe_nb2 + 1 * pe_nb3);
+    const float y0 = __fadd_rn(__fmul_rn(x0, pe00), __fmul_rn(x1, pe01));
+    const float y1 = __fadd_rn(__fmul_rn(x0, pe10), __fmul_rn(x1, pe11));
+    const uint32_t h0 = static_cast<uint32_t>(__half_as_ushort(__float2half_rn(y0)));
+    const uint32_t h1 = static_cast<uint32_t>(__half_as_ushort(__float2half_rn(y1)));
+    return h0 | (h1 << 16);
+}
+
+static __device__ __forceinline__ uint32_t wan_pack_roped_pair_with_pe_bits(float x0,
+                                                                            float x1,
+                                                                            float pe00,
+                                                                            float pe01,
+                                                                            float pe10,
+                                                                            float pe11) {
+    const float y0 = __fadd_rn(__fmul_rn(x0, pe00), __fmul_rn(x1, pe01));
+    const float y1 = __fadd_rn(__fmul_rn(x0, pe10), __fmul_rn(x1, pe11));
+    const uint32_t h0 = static_cast<uint32_t>(__half_as_ushort(__float2half_rn(y0)));
+    const uint32_t h1 = static_cast<uint32_t>(__half_as_ushort(__float2half_rn(y1)));
+    return h0 | (h1 << 16);
+}
+
 static __global__ void wan_fused_qkv_roped_half_send_pack_kernel(const char* __restrict__ q,
                                                                  const char* __restrict__ k,
                                                                  const char* __restrict__ v,
@@ -1722,6 +1803,154 @@ static __global__ void wan_fused_qkv_roped_half_send_pack_kernel(const char* __r
             const uint32_t h1 = static_cast<uint32_t>(__half_as_ushort(__float2half(v1)));
             dst[linear] = h0 | (h1 << 16);
         }
+    }
+}
+
+static __global__ void wan_fused_qkv_roped_all_half_send_pack_kernel(const char* __restrict__ q,
+                                                                     const char* __restrict__ k,
+                                                                     const char* __restrict__ v,
+                                                                     const char* __restrict__ pe,
+                                                                     uint32_t* __restrict__ dst,
+                                                                     int64_t world_size,
+                                                                     int64_t rank,
+                                                                     int64_t head_dim,
+                                                                     int64_t heads,
+                                                                     int64_t shard_sequence,
+                                                                     size_t q_nb0,
+                                                                     size_t q_nb1,
+                                                                     size_t q_nb2,
+                                                                     size_t q_nb3,
+                                                                     size_t k_nb0,
+                                                                     size_t k_nb1,
+                                                                     size_t k_nb2,
+                                                                     size_t k_nb3,
+                                                                     size_t v_nb0,
+                                                                     size_t v_nb1,
+                                                                     size_t v_nb2,
+                                                                     size_t v_nb3,
+                                                                     size_t pe_nb0,
+                                                                     size_t pe_nb1,
+                                                                     size_t pe_nb2,
+                                                                     size_t pe_nb3) {
+    const int64_t half_dim    = head_dim / 2;
+    const int64_t shard_heads = heads / world_size;
+    const int64_t packed_dim  = half_dim * 3;
+    const int64_t total       = packed_dim * shard_heads * shard_sequence * world_size;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem         = linear;
+        const int64_t d_all = rem % packed_dim;
+        rem /= packed_dim;
+        const int64_t head_local = rem % shard_heads;
+        rem /= shard_heads;
+        const int64_t seq = rem % shard_sequence;
+        rem /= shard_sequence;
+        const int64_t peer = rem;
+        const int64_t head = head_local + peer * shard_heads;
+        const int64_t global_seq = rank * shard_sequence + seq;
+
+        const int64_t plane = d_all / half_dim;
+        const int64_t half_idx = d_all - plane * half_dim;
+        const int64_t d0 = 2 * half_idx;
+        const int64_t d1 = d0 + 1;
+        if (plane == 0) {
+            dst[linear] = wan_roped_pair_to_half2_bits(q,
+                                                       pe,
+                                                       half_idx,
+                                                       head,
+                                                       seq,
+                                                       global_seq,
+                                                       q_nb0, q_nb1, q_nb2, q_nb3,
+                                                       pe_nb0, pe_nb1, pe_nb2, pe_nb3);
+        } else if (plane == 1) {
+            dst[linear] = wan_roped_pair_to_half2_bits(k,
+                                                       pe,
+                                                       half_idx,
+                                                       head,
+                                                       seq,
+                                                       global_seq,
+                                                       k_nb0, k_nb1, k_nb2, k_nb3,
+                                                       pe_nb0, pe_nb1, pe_nb2, pe_nb3);
+        } else {
+            const float v0 = *reinterpret_cast<const float*>(v + d0 * v_nb0 + head * v_nb1 + seq * v_nb2 + 0 * v_nb3);
+            const float v1 = *reinterpret_cast<const float*>(v + d1 * v_nb0 + head * v_nb1 + seq * v_nb2 + 0 * v_nb3);
+            const uint32_t h0 = static_cast<uint32_t>(__half_as_ushort(__float2half_rn(v0)));
+            const uint32_t h1 = static_cast<uint32_t>(__half_as_ushort(__float2half_rn(v1)));
+            dst[linear] = h0 | (h1 << 16);
+        }
+    }
+}
+
+static __global__ void wan_fused_qkv_roped_all_half_send_pack_triplet_kernel(
+    const char* __restrict__ q,
+    const char* __restrict__ k,
+    const char* __restrict__ v,
+    const char* __restrict__ pe,
+    uint32_t* __restrict__ dst,
+    int64_t world_size,
+    int64_t rank,
+    int64_t head_dim,
+    int64_t heads,
+    int64_t shard_sequence,
+    size_t q_nb0,
+    size_t q_nb1,
+    size_t q_nb2,
+    size_t q_nb3,
+    size_t k_nb0,
+    size_t k_nb1,
+    size_t k_nb2,
+    size_t k_nb3,
+    size_t v_nb0,
+    size_t v_nb1,
+    size_t v_nb2,
+    size_t v_nb3,
+    size_t pe_nb0,
+    size_t pe_nb1,
+    size_t pe_nb2,
+    size_t pe_nb3) {
+    const int64_t half_dim = head_dim / 2;
+    const int64_t shard_heads = heads / world_size;
+    const int64_t packed_dim = half_dim * 3;
+    const int64_t total_pairs = half_dim * shard_heads * shard_sequence * world_size;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total_pairs;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem = linear;
+        const int64_t half_idx = rem % half_dim;
+        rem /= half_dim;
+        const int64_t head_local = rem % shard_heads;
+        rem /= shard_heads;
+        const int64_t seq = rem % shard_sequence;
+        rem /= shard_sequence;
+        const int64_t peer = rem;
+        const int64_t head = head_local + peer * shard_heads;
+        const int64_t global_seq = rank * shard_sequence + seq;
+
+        const int64_t group = head_local + shard_heads * (seq + shard_sequence * peer);
+        const int64_t dst_base = half_idx + packed_dim * group;
+        const int64_t d0 = 2 * half_idx;
+        const int64_t d1 = d0 + 1;
+        const float pe00 = *reinterpret_cast<const float*>(pe + 0 * pe_nb0 + half_idx * pe_nb1 + global_seq * pe_nb2 + 0 * pe_nb3);
+        const float pe01 = *reinterpret_cast<const float*>(pe + 0 * pe_nb0 + half_idx * pe_nb1 + global_seq * pe_nb2 + 1 * pe_nb3);
+        const float pe10 = *reinterpret_cast<const float*>(pe + 1 * pe_nb0 + half_idx * pe_nb1 + global_seq * pe_nb2 + 0 * pe_nb3);
+        const float pe11 = *reinterpret_cast<const float*>(pe + 1 * pe_nb0 + half_idx * pe_nb1 + global_seq * pe_nb2 + 1 * pe_nb3);
+
+        const float q0 = *reinterpret_cast<const float*>(q + d0 * q_nb0 + head * q_nb1 + seq * q_nb2 + 0 * q_nb3);
+        const float q1 = *reinterpret_cast<const float*>(q + d1 * q_nb0 + head * q_nb1 + seq * q_nb2 + 0 * q_nb3);
+        dst[dst_base] = wan_pack_roped_pair_with_pe_bits(q0, q1, pe00, pe01, pe10, pe11);
+
+        const float k0 = *reinterpret_cast<const float*>(k + d0 * k_nb0 + head * k_nb1 + seq * k_nb2 + 0 * k_nb3);
+        const float k1 = *reinterpret_cast<const float*>(k + d1 * k_nb0 + head * k_nb1 + seq * k_nb2 + 0 * k_nb3);
+        dst[dst_base + half_dim] = wan_pack_roped_pair_with_pe_bits(k0, k1, pe00, pe01, pe10, pe11);
+
+        const float v0 = *reinterpret_cast<const float*>(v + d0 * v_nb0 + head * v_nb1 + seq * v_nb2 + 0 * v_nb3);
+        const float v1 = *reinterpret_cast<const float*>(v + d1 * v_nb0 + head * v_nb1 + seq * v_nb2 + 0 * v_nb3);
+        const uint32_t h0 = static_cast<uint32_t>(__half_as_ushort(__float2half_rn(v0)));
+        const uint32_t h1 = static_cast<uint32_t>(__half_as_ushort(__float2half_rn(v1)));
+        dst[dst_base + 2 * half_dim] = h0 | (h1 << 16);
     }
 }
 
@@ -1819,6 +2048,119 @@ static __global__ void wan_fused_attn_head_to_seq_send_pack_f32_kernel(const cha
     }
 }
 
+static __global__ void wan_fused_attn_head_to_seq_send_pack_f16_kernel(const char* __restrict__ attn,
+                                                                       half* __restrict__ dst,
+                                                                       int64_t world_size,
+                                                                       int64_t head_dim,
+                                                                       int64_t shard_heads,
+                                                                       int64_t sequence,
+                                                                       bool attn_is_f16,
+                                                                       size_t attn_nb0,
+                                                                       size_t attn_nb1,
+                                                                       size_t attn_nb2,
+                                                                       size_t attn_nb3) {
+    const int64_t shard_sequence = sequence / world_size;
+    const int64_t count_per_peer = head_dim * shard_heads * shard_sequence;
+    const int64_t total          = count_per_peer * world_size;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem        = linear;
+        const int64_t peer = rem / count_per_peer;
+        rem -= peer * count_per_peer;
+        const int64_t d = rem % head_dim;
+        rem /= head_dim;
+        const int64_t head = rem % shard_heads;
+        rem /= shard_heads;
+        const int64_t local_seq = rem;
+        const int64_t seq = peer * shard_sequence + local_seq;
+        const char* src = attn +
+                          d * attn_nb0 +
+                          head * attn_nb1 +
+                          seq * attn_nb2 +
+                          0 * attn_nb3;
+        dst[linear] = attn_is_f16 ?
+                          *reinterpret_cast<const half*>(src) :
+                          __float2half(*reinterpret_cast<const float*>(src));
+    }
+}
+
+static __global__ void wan_fused_attn_head_to_seq_send_pack_f32_to_f16_h2_kernel(
+    const char* __restrict__ attn,
+    half2* __restrict__ dst,
+    int64_t world_size,
+    int64_t head_dim,
+    int64_t shard_heads,
+    int64_t sequence,
+    size_t attn_nb0,
+    size_t attn_nb1,
+    size_t attn_nb2,
+    size_t attn_nb3) {
+    const int64_t head_dim2 = head_dim / 2;
+    const int64_t shard_sequence = sequence / world_size;
+    const int64_t count_per_peer2 = head_dim2 * shard_heads * shard_sequence;
+    const int64_t total = count_per_peer2 * world_size;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem = linear;
+        const int64_t peer = rem / count_per_peer2;
+        rem -= peer * count_per_peer2;
+        const int64_t d2 = rem % head_dim2;
+        rem /= head_dim2;
+        const int64_t head = rem % shard_heads;
+        rem /= shard_heads;
+        const int64_t local_seq = rem;
+        const int64_t seq = peer * shard_sequence + local_seq;
+
+        const char* src = attn +
+                          (2 * d2) * attn_nb0 +
+                          head * attn_nb1 +
+                          seq * attn_nb2 +
+                          0 * attn_nb3;
+        dst[linear] = __float22half2_rn(*reinterpret_cast<const float2*>(src));
+    }
+}
+
+static __global__ void wan_fused_attn_head_to_seq_send_pack_f16_h2_kernel(const char* __restrict__ attn,
+                                                                          half2* __restrict__ dst,
+                                                                          int64_t world_size,
+                                                                          int64_t head_dim,
+                                                                          int64_t shard_heads,
+                                                                          int64_t sequence,
+                                                                          size_t attn_nb0,
+                                                                          size_t attn_nb1,
+                                                                          size_t attn_nb2,
+                                                                          size_t attn_nb3) {
+    const int64_t head_dim2 = head_dim / 2;
+    const int64_t shard_sequence = sequence / world_size;
+    const int64_t count_per_peer2 = head_dim2 * shard_heads * shard_sequence;
+    const int64_t total = count_per_peer2 * world_size;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem = linear;
+        const int64_t peer = rem / count_per_peer2;
+        rem -= peer * count_per_peer2;
+        const int64_t d2 = rem % head_dim2;
+        rem /= head_dim2;
+        const int64_t head = rem % shard_heads;
+        rem /= shard_heads;
+        const int64_t local_seq = rem;
+        const int64_t seq = peer * shard_sequence + local_seq;
+
+        const char* src = attn +
+                          (2 * d2) * attn_nb0 +
+                          head * attn_nb1 +
+                          seq * attn_nb2 +
+                          0 * attn_nb3;
+        dst[linear] = *reinterpret_cast<const half2*>(src);
+    }
+}
+
 static __global__ void wan_fused_attn_head_to_seq_recv_unpack_f32_kernel(const char* __restrict__ recv_flat,
                                                                          float* __restrict__ dst,
                                                                          int64_t world_size,
@@ -1845,6 +2187,67 @@ static __global__ void wan_fused_attn_head_to_seq_recv_unpack_f32_kernel(const c
                                 local_head * head_dim +
                                 local_seq * head_dim * shard_heads;
         dst[linear] = *reinterpret_cast<const float*>(recv_flat + src_idx * sizeof(float));
+    }
+}
+
+static __global__ void wan_fused_attn_head_to_seq_recv_unpack_f16_kernel(const half* __restrict__ recv_flat,
+                                                                         float* __restrict__ dst,
+                                                                         int64_t world_size,
+                                                                         int64_t head_dim,
+                                                                         int64_t heads,
+                                                                         int64_t shard_sequence) {
+    const int64_t shard_heads = heads / world_size;
+    const int64_t count_per_peer = head_dim * shard_heads * shard_sequence;
+    const int64_t total = head_dim * heads * shard_sequence;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem    = linear;
+        const int64_t d = rem % head_dim;
+        rem /= head_dim;
+        const int64_t head = rem % heads;
+        rem /= heads;
+        const int64_t local_seq  = rem;
+        const int64_t src_peer   = head / shard_heads;
+        const int64_t local_head = head - src_peer * shard_heads;
+        const int64_t src_idx = src_peer * count_per_peer +
+                                d +
+                                local_head * head_dim +
+                                local_seq * head_dim * shard_heads;
+        dst[linear] = __half2float(recv_flat[src_idx]);
+    }
+}
+
+static __global__ void wan_fused_attn_head_to_seq_recv_unpack_f16_h2_kernel(const half* __restrict__ recv_flat,
+                                                                            float* __restrict__ dst,
+                                                                            int64_t world_size,
+                                                                            int64_t head_dim,
+                                                                            int64_t heads,
+                                                                            int64_t shard_sequence) {
+    const int64_t shard_heads = heads / world_size;
+    const int64_t head_dim2 = head_dim / 2;
+    const int64_t count_per_peer = head_dim * shard_heads * shard_sequence;
+    const int64_t total = head_dim2 * heads * shard_sequence;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem = linear;
+        const int64_t d2 = rem % head_dim2;
+        rem /= head_dim2;
+        const int64_t head = rem % heads;
+        rem /= heads;
+        const int64_t local_seq  = rem;
+        const int64_t src_peer   = head / shard_heads;
+        const int64_t local_head = head - src_peer * shard_heads;
+        const int64_t src_idx = src_peer * count_per_peer +
+                                2 * d2 +
+                                local_head * head_dim +
+                                local_seq * head_dim * shard_heads;
+        const int64_t dst_idx = 2 * d2 + head_dim * (head + heads * local_seq);
+        *reinterpret_cast<float2*>(dst + dst_idx) =
+            __half22float2(*reinterpret_cast<const half2*>(recv_flat + src_idx));
     }
 }
 
@@ -2129,6 +2532,158 @@ static __global__ void wan_fused_roped_kv_recv_unpack_kernel(const uint32_t* __r
                                   static_cast<uint16_t>(packed & 0xffffu) :
                                   static_cast<uint16_t>(packed >> 16);
         dst[linear] = __ushort_as_half(bits);
+    }
+}
+
+static __global__ void wan_fused_roped_all_half_recv_unpack_kernel(const uint32_t* __restrict__ recv_flat,
+                                                                   half* __restrict__ dst,
+                                                                   int64_t world_size,
+                                                                   int64_t first_plane,
+                                                                   int64_t head_dim,
+                                                                   int64_t shard_heads,
+                                                                   int64_t shard_sequence,
+                                                                   int64_t out_planes) {
+    const int64_t sequence   = shard_sequence * world_size;
+    const int64_t half_dim   = head_dim / 2;
+    const int64_t packed_dim = half_dim * 3;
+    const int64_t total      = head_dim * sequence * shard_heads * out_planes;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem       = linear;
+        const int64_t d   = rem % head_dim;
+        rem /= head_dim;
+        const int64_t seq = rem % sequence;
+        rem /= sequence;
+        const int64_t head = rem % shard_heads;
+        rem /= shard_heads;
+        const int64_t plane = first_plane + rem;
+        const int64_t peer = seq / shard_sequence;
+        const int64_t local_seq = seq - peer * shard_sequence;
+        const int64_t base_idx = head * packed_dim +
+                                 local_seq * packed_dim * shard_heads +
+                                 peer * packed_dim * shard_heads * shard_sequence;
+        const int64_t src_idx = base_idx + plane * half_dim + d / 2;
+        const uint32_t packed = recv_flat[src_idx];
+        const uint16_t bits = (d & 1) == 0 ?
+                                  static_cast<uint16_t>(packed & 0xffffu) :
+                                  static_cast<uint16_t>(packed >> 16);
+        dst[linear] = __ushort_as_half(bits);
+    }
+}
+
+static __global__ void wan_fused_roped_all_half_recv_unpack_h2_kernel(const uint32_t* __restrict__ recv_flat,
+                                                                      uint32_t* __restrict__ dst,
+                                                                      int64_t world_size,
+                                                                      int64_t first_plane,
+                                                                      int64_t head_dim,
+                                                                      int64_t shard_heads,
+                                                                      int64_t shard_sequence,
+                                                                      int64_t out_planes) {
+    const int64_t sequence   = shard_sequence * world_size;
+    const int64_t half_dim   = head_dim / 2;
+    const int64_t packed_dim = half_dim * 3;
+    const int64_t total      = half_dim * sequence * shard_heads * out_planes;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem          = linear;
+        const int64_t half   = rem % half_dim;
+        rem /= half_dim;
+        const int64_t seq    = rem % sequence;
+        rem /= sequence;
+        const int64_t head   = rem % shard_heads;
+        rem /= shard_heads;
+        const int64_t plane  = first_plane + rem;
+        const int64_t peer   = seq / shard_sequence;
+        const int64_t local_seq = seq - peer * shard_sequence;
+        const int64_t base_idx = head * packed_dim +
+                                 local_seq * packed_dim * shard_heads +
+                                 peer * packed_dim * shard_heads * shard_sequence;
+        const int64_t src_idx = base_idx + plane * half_dim + half;
+        const int64_t dst_idx_h2 = half +
+                                   half_dim * (seq + sequence * (head + shard_heads * rem));
+        dst[dst_idx_h2] = recv_flat[src_idx];
+    }
+}
+
+static __global__ void wan_fused_roped_all_half_recv_unpack_h2_vec2_kernel(const uint32_t* __restrict__ recv_flat,
+                                                                           uint32_t* __restrict__ dst,
+                                                                           int64_t world_size,
+                                                                           int64_t first_plane,
+                                                                           int64_t head_dim,
+                                                                           int64_t shard_heads,
+                                                                           int64_t shard_sequence,
+                                                                           int64_t out_planes) {
+    const int64_t sequence   = shard_sequence * world_size;
+    const int64_t half_dim   = head_dim / 2;
+    const int64_t half_dim2  = half_dim / 2;
+    const int64_t packed_dim = half_dim * 3;
+    const int64_t total      = half_dim2 * sequence * shard_heads * out_planes;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem            = linear;
+        const int64_t half2    = rem % half_dim2;
+        rem /= half_dim2;
+        const int64_t seq      = rem % sequence;
+        rem /= sequence;
+        const int64_t head     = rem % shard_heads;
+        rem /= shard_heads;
+        const int64_t plane    = first_plane + rem;
+        const int64_t peer     = seq / shard_sequence;
+        const int64_t local_seq = seq - peer * shard_sequence;
+        const int64_t half     = half2 * 2;
+        const int64_t base_idx = head * packed_dim +
+                                 local_seq * packed_dim * shard_heads +
+                                 peer * packed_dim * shard_heads * shard_sequence;
+        const int64_t src_idx = base_idx + plane * half_dim + half;
+        const int64_t dst_idx_h2 = half +
+                                   half_dim * (seq + sequence * (head + shard_heads * rem));
+        *reinterpret_cast<uint2*>(dst + dst_idx_h2) =
+            *reinterpret_cast<const uint2*>(recv_flat + src_idx);
+    }
+}
+
+static __global__ void wan_fused_roped_all_half_recv_unpack_h2_vec4_kernel(const uint32_t* __restrict__ recv_flat,
+                                                                           uint32_t* __restrict__ dst,
+                                                                           int64_t world_size,
+                                                                           int64_t first_plane,
+                                                                           int64_t head_dim,
+                                                                           int64_t shard_heads,
+                                                                           int64_t shard_sequence,
+                                                                           int64_t out_planes) {
+    const int64_t sequence   = shard_sequence * world_size;
+    const int64_t half_dim   = head_dim / 2;
+    const int64_t half_dim4  = half_dim / 4;
+    const int64_t packed_dim = half_dim * 3;
+    const int64_t total      = half_dim4 * sequence * shard_heads * out_planes;
+
+    for (int64_t linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        int64_t rem            = linear;
+        const int64_t half4    = rem % half_dim4;
+        rem /= half_dim4;
+        const int64_t seq      = rem % sequence;
+        rem /= sequence;
+        const int64_t head     = rem % shard_heads;
+        rem /= shard_heads;
+        const int64_t plane    = first_plane + rem;
+        const int64_t peer     = seq / shard_sequence;
+        const int64_t local_seq = seq - peer * shard_sequence;
+        const int64_t half     = half4 * 4;
+        const int64_t base_idx = head * packed_dim +
+                                 local_seq * packed_dim * shard_heads +
+                                 peer * packed_dim * shard_heads * shard_sequence;
+        const int64_t src_idx = base_idx + plane * half_dim + half;
+        const int64_t dst_idx_h2 = half +
+                                   half_dim * (seq + sequence * (head + shard_heads * rem));
+        *reinterpret_cast<uint4*>(dst + dst_idx_h2) =
+            *reinterpret_cast<const uint4*>(recv_flat + src_idx);
     }
 }
 
@@ -5020,7 +5575,7 @@ void ggml_cuda_op_qwen_fused_qkv_pack(ggml_backend_cuda_context& ctx, ggml_tenso
         return;
     }
 
-    if (qwen_params->mode == 37) {
+    if (qwen_params->mode == 37 || qwen_params->mode == 56) {
         GGML_ASSERT(dst->type == GGML_TYPE_F32);
         const ggml_tensor* q = dst->src[0];
         const ggml_tensor* k = dst->src[1];
@@ -5043,7 +5598,7 @@ void ggml_cuda_op_qwen_fused_qkv_pack(ggml_backend_cuda_context& ctx, ggml_tenso
         GGML_ASSERT(pe->ne[1] == q->ne[0] / 2);
         GGML_ASSERT(pe->ne[2] >= q->ne[2] * world_size);
         GGML_ASSERT(pe->ne[3] == 2);
-        const int64_t packed_dim = q->ne[0] * 2;
+        const int64_t packed_dim = qwen_params->mode == 56 ? q->ne[0] * 3 / 2 : q->ne[0] * 2;
         const int64_t shard_heads = q->ne[1] / world_size;
         GGML_ASSERT(dst->ne[0] == packed_dim * shard_heads * q->ne[2] * world_size);
 
@@ -5051,22 +5606,68 @@ void ggml_cuda_op_qwen_fused_qkv_pack(ggml_backend_cuda_context& ctx, ggml_tenso
         const int threads = 256;
         const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
         cudaStream_t stream = ctx.stream();
-        wan_fused_qkv_roped_half_send_pack_kernel<<<blocks, threads, 0, stream>>>(
-            static_cast<const char*>(q->data),
-            static_cast<const char*>(k->data),
-            static_cast<const char*>(v->data),
-            static_cast<const char*>(pe->data),
-            static_cast<uint32_t*>(dst->data),
-            world_size,
-            rank,
-            q->ne[0],
-            q->ne[1],
-            q->ne[2],
-            q->nb[0], q->nb[1], q->nb[2], q->nb[3],
-            k->nb[0], k->nb[1], k->nb[2], k->nb[3],
-            v->nb[0], v->nb[1], v->nb[2], v->nb[3],
-            pe->nb[0], pe->nb[1], pe->nb[2], pe->nb[3]);
+        cudaEvent_t profile_start = nullptr;
+        cudaEvent_t profile_stop = nullptr;
+        const bool profile = ggml_cuda_qwen_fused_profile_begin(stream, &profile_start, &profile_stop);
+        if (qwen_params->mode == 56) {
+            const bool use_triplet = ggml_cuda_wan_sp_triplet_qkv_send_pack_enabled();
+            const int64_t triplet_total = (q->ne[0] / 2) * shard_heads * q->ne[2] * world_size;
+            const int triplet_blocks =
+                static_cast<int>(std::min<int64_t>((triplet_total + threads - 1) / threads, 65535));
+            if (use_triplet) {
+                wan_fused_qkv_roped_all_half_send_pack_triplet_kernel<<<triplet_blocks, threads, 0, stream>>>(
+                    static_cast<const char*>(q->data),
+                    static_cast<const char*>(k->data),
+                    static_cast<const char*>(v->data),
+                    static_cast<const char*>(pe->data),
+                    static_cast<uint32_t*>(dst->data),
+                    world_size,
+                    rank,
+                    q->ne[0],
+                    q->ne[1],
+                    q->ne[2],
+                    q->nb[0], q->nb[1], q->nb[2], q->nb[3],
+                    k->nb[0], k->nb[1], k->nb[2], k->nb[3],
+                    v->nb[0], v->nb[1], v->nb[2], v->nb[3],
+                    pe->nb[0], pe->nb[1], pe->nb[2], pe->nb[3]);
+            } else {
+                wan_fused_qkv_roped_all_half_send_pack_kernel<<<blocks, threads, 0, stream>>>(
+                    static_cast<const char*>(q->data),
+                    static_cast<const char*>(k->data),
+                    static_cast<const char*>(v->data),
+                    static_cast<const char*>(pe->data),
+                    static_cast<uint32_t*>(dst->data),
+                    world_size,
+                    rank,
+                    q->ne[0],
+                    q->ne[1],
+                    q->ne[2],
+                    q->nb[0], q->nb[1], q->nb[2], q->nb[3],
+                    k->nb[0], k->nb[1], k->nb[2], k->nb[3],
+                    v->nb[0], v->nb[1], v->nb[2], v->nb[3],
+                    pe->nb[0], pe->nb[1], pe->nb[2], pe->nb[3]);
+            }
+        } else {
+            wan_fused_qkv_roped_half_send_pack_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<const char*>(q->data),
+                static_cast<const char*>(k->data),
+                static_cast<const char*>(v->data),
+                static_cast<const char*>(pe->data),
+                static_cast<uint32_t*>(dst->data),
+                world_size,
+                rank,
+                q->ne[0],
+                q->ne[1],
+                q->ne[2],
+                q->nb[0], q->nb[1], q->nb[2], q->nb[3],
+                k->nb[0], k->nb[1], k->nb[2], k->nb[3],
+                v->nb[0], v->nb[1], v->nb[2], v->nb[3],
+                pe->nb[0], pe->nb[1], pe->nb[2], pe->nb[3]);
+        }
         CUDA_CHECK(cudaGetLastError());
+        if (profile) {
+            ggml_cuda_qwen_fused_profile_end(stream, profile_start, profile_stop, qwen_params->mode, dst);
+        }
         return;
     }
 
@@ -6114,6 +6715,98 @@ void ggml_cuda_op_qwen_fused_qkv_pack(ggml_backend_cuda_context& ctx, ggml_tenso
         return;
     }
 
+    if (qwen_params->mode == 57 || qwen_params->mode == 58) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F16);
+        const ggml_tensor* recv_flat = dst->src[0];
+        GGML_ASSERT(recv_flat);
+        GGML_ASSERT(recv_flat->type == GGML_TYPE_F32);
+        const int64_t world_size = qwen_params->txt_real_seq;
+        GGML_ASSERT(world_size > 0);
+        GGML_ASSERT(qwen_params->mode == 57 ? dst->ne[3] == 1 : dst->ne[3] == 2);
+        GGML_ASSERT(dst->ne[1] % world_size == 0);
+        const int64_t head_dim = dst->ne[0];
+        const int64_t shard_sequence = dst->ne[1] / world_size;
+        const int64_t shard_heads = dst->ne[2];
+        const int64_t packed_dim = head_dim * 3 / 2;
+        GGML_ASSERT(head_dim > 0 && head_dim % 2 == 0);
+        GGML_ASSERT(recv_flat->ne[0] == packed_dim * shard_heads * shard_sequence * world_size);
+
+        const bool use_h2 = dst->nb[0] == sizeof(half) &&
+                            (head_dim % 2) == 0 &&
+                            ggml_cuda_qwen_ptr_aligned(recv_flat->data, alignof(uint32_t)) &&
+                            ggml_cuda_qwen_ptr_aligned(dst->data, alignof(uint32_t));
+        const bool use_vec2 = use_h2 &&
+                              ggml_cuda_wan_sp_vec2_recv_unpack_enabled() &&
+                              (head_dim % 4) == 0 &&
+                              ggml_cuda_qwen_ptr_aligned(recv_flat->data, alignof(uint2)) &&
+                              ggml_cuda_qwen_ptr_aligned(dst->data, alignof(uint2));
+        const bool use_vec4 = use_h2 &&
+                              ggml_cuda_wan_sp_vec2_recv_unpack_enabled() &&
+                              (head_dim % 8) == 0 &&
+                              ggml_cuda_qwen_ptr_aligned(recv_flat->data, alignof(uint4)) &&
+                              ggml_cuda_qwen_ptr_aligned(dst->data, alignof(uint4));
+        int64_t total = ggml_nelements(dst);
+        if (use_vec4) {
+            total /= 8;
+        } else if (use_vec2) {
+            total /= 4;
+        } else if (use_h2) {
+            total /= 2;
+        }
+        const int threads = 256;
+        const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
+        cudaStream_t stream = ctx.stream();
+        cudaEvent_t profile_start = nullptr;
+        cudaEvent_t profile_stop = nullptr;
+        const bool profile = ggml_cuda_qwen_fused_profile_begin(stream, &profile_start, &profile_stop);
+        if (use_vec4) {
+            wan_fused_roped_all_half_recv_unpack_h2_vec4_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<const uint32_t*>(recv_flat->data),
+                static_cast<uint32_t*>(dst->data),
+                world_size,
+                qwen_params->mode == 57 ? 0 : 1,
+                head_dim,
+                shard_heads,
+                shard_sequence,
+                dst->ne[3]);
+        } else if (use_vec2) {
+            wan_fused_roped_all_half_recv_unpack_h2_vec2_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<const uint32_t*>(recv_flat->data),
+                static_cast<uint32_t*>(dst->data),
+                world_size,
+                qwen_params->mode == 57 ? 0 : 1,
+                head_dim,
+                shard_heads,
+                shard_sequence,
+                dst->ne[3]);
+        } else if (use_h2) {
+            wan_fused_roped_all_half_recv_unpack_h2_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<const uint32_t*>(recv_flat->data),
+                static_cast<uint32_t*>(dst->data),
+                world_size,
+                qwen_params->mode == 57 ? 0 : 1,
+                head_dim,
+                shard_heads,
+                shard_sequence,
+                dst->ne[3]);
+        } else {
+            wan_fused_roped_all_half_recv_unpack_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<const uint32_t*>(recv_flat->data),
+                static_cast<half*>(dst->data),
+                world_size,
+                qwen_params->mode == 57 ? 0 : 1,
+                head_dim,
+                shard_heads,
+                shard_sequence,
+                dst->ne[3]);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        if (profile) {
+            ggml_cuda_qwen_fused_profile_end(stream, profile_start, profile_stop, qwen_params->mode, dst);
+        }
+        return;
+    }
+
     if (qwen_params->mode == 24) {
         GGML_ASSERT(dst->type == GGML_TYPE_F32);
         const ggml_tensor* attn = dst->src[0];
@@ -6144,6 +6837,78 @@ void ggml_cuda_op_qwen_fused_qkv_pack(ggml_backend_cuda_context& ctx, ggml_tenso
         return;
     }
 
+    if (qwen_params->mode == 59) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F16);
+        const ggml_tensor* attn = dst->src[0];
+        GGML_ASSERT(attn);
+        GGML_ASSERT(attn->type == GGML_TYPE_F32 || attn->type == GGML_TYPE_F16);
+        const int64_t world_size = qwen_params->txt_real_seq;
+        GGML_ASSERT(world_size > 0);
+        GGML_ASSERT(attn->ne[3] == 1);
+        GGML_ASSERT(attn->ne[2] % world_size == 0);
+        const int64_t head_dim = attn->ne[0];
+        const int64_t shard_heads = attn->ne[1];
+        const int64_t sequence = attn->ne[2];
+        GGML_ASSERT(dst->ne[0] == head_dim * shard_heads * sequence);
+
+        const bool use_f16_h2 = attn->type == GGML_TYPE_F16 &&
+                                attn->nb[0] == sizeof(half) &&
+                                (head_dim % 2) == 0 &&
+                                ggml_cuda_qwen_ptr_aligned(attn->data, alignof(half2)) &&
+                                ggml_cuda_qwen_ptr_aligned(dst->data, alignof(half2)) &&
+                                (attn->nb[1] % alignof(half2)) == 0 &&
+                                (attn->nb[2] % alignof(half2)) == 0;
+        const bool use_f32_to_f16_h2 = attn->type == GGML_TYPE_F32 &&
+                                       attn->nb[0] == sizeof(float) &&
+                                       (head_dim % 2) == 0 &&
+                                       ggml_cuda_qwen_ptr_aligned(attn->data, alignof(float2)) &&
+                                       ggml_cuda_qwen_ptr_aligned(dst->data, alignof(half2)) &&
+                                       (attn->nb[1] % alignof(float2)) == 0 &&
+                                       (attn->nb[2] % alignof(float2)) == 0;
+        const int64_t total = (use_f16_h2 || use_f32_to_f16_h2) ? ggml_nelements(dst) / 2 :
+                                                                  ggml_nelements(dst);
+        const int threads = 256;
+        const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
+        cudaStream_t stream = ctx.stream();
+        cudaEvent_t profile_start = nullptr;
+        cudaEvent_t profile_stop = nullptr;
+        const bool profile = ggml_cuda_qwen_fused_profile_begin(stream, &profile_start, &profile_stop);
+        if (use_f16_h2) {
+            wan_fused_attn_head_to_seq_send_pack_f16_h2_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<const char*>(attn->data),
+                reinterpret_cast<half2*>(dst->data),
+                world_size,
+                head_dim,
+                shard_heads,
+                sequence,
+                attn->nb[0], attn->nb[1], attn->nb[2], attn->nb[3]);
+        } else if (use_f32_to_f16_h2) {
+            wan_fused_attn_head_to_seq_send_pack_f32_to_f16_h2_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<const char*>(attn->data),
+                reinterpret_cast<half2*>(dst->data),
+                world_size,
+                head_dim,
+                shard_heads,
+                sequence,
+                attn->nb[0], attn->nb[1], attn->nb[2], attn->nb[3]);
+        } else {
+            wan_fused_attn_head_to_seq_send_pack_f16_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<const char*>(attn->data),
+                static_cast<half*>(dst->data),
+                world_size,
+                head_dim,
+                shard_heads,
+                sequence,
+                attn->type == GGML_TYPE_F16,
+                attn->nb[0], attn->nb[1], attn->nb[2], attn->nb[3]);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        if (profile) {
+            ggml_cuda_qwen_fused_profile_end(stream, profile_start, profile_stop, qwen_params->mode, dst);
+        }
+        return;
+    }
+
     if (qwen_params->mode == 25) {
         GGML_ASSERT(dst->type == GGML_TYPE_F32);
         const ggml_tensor* recv_flat = dst->src[0];
@@ -6170,6 +6935,56 @@ void ggml_cuda_op_qwen_fused_qkv_pack(ggml_backend_cuda_context& ctx, ggml_tenso
             heads,
             shard_sequence);
         CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    if (qwen_params->mode == 60) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        const ggml_tensor* recv_flat = dst->src[0];
+        GGML_ASSERT(recv_flat);
+        GGML_ASSERT(recv_flat->type == GGML_TYPE_F16);
+        const int64_t world_size = qwen_params->txt_real_seq;
+        GGML_ASSERT(world_size > 0);
+        GGML_ASSERT(dst->ne[3] == 1);
+        GGML_ASSERT(dst->ne[1] % world_size == 0);
+        const int64_t head_dim = dst->ne[0];
+        const int64_t heads = dst->ne[1];
+        const int64_t shard_sequence = dst->ne[2];
+        GGML_ASSERT(recv_flat->ne[0] == head_dim * (heads / world_size) * shard_sequence * world_size);
+
+        const bool use_h2 =
+            (head_dim % 2) == 0 &&
+            dst->nb[0] == sizeof(float) &&
+            ggml_cuda_qwen_ptr_aligned(recv_flat->data, alignof(half2)) &&
+            ggml_cuda_qwen_ptr_aligned(dst->data, alignof(float2));
+        const int64_t total = use_h2 ? ggml_nelements(dst) / 2 : ggml_nelements(dst);
+        const int threads = 256;
+        const int blocks = static_cast<int>(std::min<int64_t>((total + threads - 1) / threads, 65535));
+        cudaStream_t stream = ctx.stream();
+        cudaEvent_t profile_start = nullptr;
+        cudaEvent_t profile_stop = nullptr;
+        const bool profile = ggml_cuda_qwen_fused_profile_begin(stream, &profile_start, &profile_stop);
+        if (use_h2) {
+            wan_fused_attn_head_to_seq_recv_unpack_f16_h2_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<const half*>(recv_flat->data),
+                static_cast<float*>(dst->data),
+                world_size,
+                head_dim,
+                heads,
+                shard_sequence);
+        } else {
+            wan_fused_attn_head_to_seq_recv_unpack_f16_kernel<<<blocks, threads, 0, stream>>>(
+                static_cast<const half*>(recv_flat->data),
+                static_cast<float*>(dst->data),
+                world_size,
+                head_dim,
+                heads,
+                shard_sequence);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        if (profile) {
+            ggml_cuda_qwen_fused_profile_end(stream, profile_start, profile_stop, qwen_params->mode, dst);
+        }
         return;
     }
 

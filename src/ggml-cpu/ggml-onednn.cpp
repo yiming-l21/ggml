@@ -458,32 +458,37 @@ inline float ed_ld(const void* base, int type, int64_t idx){
 inline uint16_t ed_f2bf16(float f){ uint32_t u; std::memcpy(&u,&f,4); return (uint16_t)((u + 0x7fff + ((u>>16)&1)) >> 16); }
 
 #if defined(__AVX512F__)
-// AVX-512 exp (same minimax poly as ggml's ggml_v_expf; ~1e-6 rel err over the
-// softmax range). Used to vectorize the flash softmax exp — the dominant scalar
-// cost (57% of flash time). Mirrors ATen's vectorized CPU flash softmax.
+// AVX-512 exp — copied verbatim from ggml's ggml_v_expf (vec.h). The previous
+// hand-rolled version had a broken manual 2^n reconstruction (returned ~2x the
+// true exp everywhere, garbage for large-negative inputs), which corrupted the
+// flash softmax denominator whenever attention scores were large (peaked softmax)
+// — the SD3 d=64 "garbage image" bug. This proven version uses _mm512_scalef_ps
+// for the 2^n scaling and the full 5-term minimax poly.
 inline __m512 ed_v_expf(__m512 x) {
-    const __m512 r   = _mm512_set1_ps(0x1.8p23f);
-    const __m512 z   = _mm512_fmadd_ps(x, _mm512_set1_ps(0x1.715476p+0f), r);
-    const __m512 n   = _mm512_sub_ps(z, r);
-    const __m512 b   = _mm512_fnmadd_ps(n, _mm512_set1_ps(0x1.7f7d1cp-20f),
-                       _mm512_fnmadd_ps(n, _mm512_set1_ps(0x1.62e4p-1f), x));
-    const __m512i e  = _mm512_slli_epi32(_mm512_castps_si512(z), 23);
-    const __m512 k   = _mm512_castsi512_ps(_mm512_add_epi32(e, _mm512_castps_si512(_mm512_set1_ps(1))));
-    const __mmask16 c = _mm512_cmp_ps_mask(_mm512_abs_ps(n), _mm512_set1_ps(126), _CMP_GT_OQ);
-    const __m512 u   = _mm512_mul_ps(b, b);
-    const __m512 j   = _mm512_fmadd_ps(
-        _mm512_fmadd_ps(_mm512_fmadd_ps(_mm512_set1_ps(0x1.573e2ep-5f), b, _mm512_set1_ps(0x1.555b98p-3f)), u,
-                        _mm512_fmadd_ps(_mm512_set1_ps(0x1.fffdb6p-2f), b, _mm512_set1_ps(0x1.ffffecp-1f))),
-        b, _mm512_set1_ps(1));
-    if (_mm512_kortestz(c, c)) return _mm512_fmadd_ps(j, k, k);
-    const __m512i g = _mm512_and_si512(_mm512_movm_epi32(_mm512_cmp_ps_mask(n, _mm512_setzero_ps(), _CMP_LE_OQ)),
-                                       _mm512_set1_epi32(0x82000000u));
-    const __m512 s1 = _mm512_castsi512_ps(_mm512_add_epi32(g, _mm512_set1_epi32(0x7f000000u)));
-    const __m512 s2 = _mm512_castsi512_ps(_mm512_sub_epi32(_mm512_castps_si512(k), g));
-    const __mmask16 d = _mm512_cmp_ps_mask(_mm512_abs_ps(n), _mm512_set1_ps(192), _CMP_GT_OQ);
-    return _mm512_mask_blend_ps(d,
-        _mm512_mask_blend_ps(c, _mm512_fmadd_ps(k, j, k), _mm512_mul_ps(_mm512_fmadd_ps(s2, j, s2), s1)),
-        _mm512_mul_ps(s1, s1));
+    const __m512 r = _mm512_set1_ps(0x1.8p23f);
+    const __m512 z = _mm512_fmadd_ps(x, _mm512_set1_ps(0x1.715476p+0f), r);
+    const __m512 n = _mm512_sub_ps(z, r);
+    const __m512 b =
+        _mm512_fnmadd_ps(n, _mm512_set1_ps(0x1.7f7d1cp-20f),
+                         _mm512_fnmadd_ps(n, _mm512_set1_ps(0x1.62e4p-1f), x));
+    const __mmask16 d =
+        _mm512_cmp_ps_mask(_mm512_abs_ps(n), _mm512_set1_ps(192), _CMP_GT_OQ);
+    const __m512 u = _mm512_mul_ps(b, b);
+    const __m512 j = _mm512_fmadd_ps(
+        _mm512_fmadd_ps(_mm512_fmadd_ps(_mm512_set1_ps(0x1.0e4020p-7f), b,
+                                        _mm512_set1_ps(0x1.573e2ep-5f)),
+                        u,
+                        _mm512_fmadd_ps(_mm512_set1_ps(0x1.555e66p-3f), b,
+                                        _mm512_set1_ps(0x1.fffdb6p-2f))),
+        u,
+        _mm512_fmadd_ps(_mm512_set1_ps(0x1.ffffecp-1f), b, _mm512_set1_ps(1.0F)));
+    const __m512 res = _mm512_scalef_ps(j, n);
+    if (_mm512_kortestz(d, d))
+        return res;
+    const __m512 zero = _mm512_setzero_ps();
+    const __m512 alt = _mm512_mask_blend_ps(
+        _mm512_cmp_ps_mask(n, zero, _CMP_LE_OQ), _mm512_set1_ps(INFINITY), zero);
+    return _mm512_mask_blend_ps(d, res, alt);
 }
 // Fused: for row srow[0..kn), compute p=exp((srow*scale)-mcur), store bf16 into
 // pbf[0..kvBlk), return sum(p). Scalar tail for kn%16.

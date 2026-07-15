@@ -6988,6 +6988,53 @@ static void ggml_compute_forward_conv_3d_impl(const ggml_compute_params * params
 
             char * dst_row = (char *) tmp + (p % patches_per_batch) * knl_n_total * traits->type_size;
 
+            // edge-dit: hoist loop-invariant bound checks and base-pointer math out of
+            // the innermost loop. sz/sy depend only on kz/ky; the src channel base and
+            // the z/y plane offset are constant across kx. The original body recomputed
+            // all of that (and the out-of-bounds test) per element — the im2col fill was
+            // ~71% of conv3d time (2.3s of 3.3s in Wan VAE decode). Only the sx bound and
+            // the fp32->kernel_type convert stay in the hot inner loop, which the compiler
+            // can then vectorize over contiguous kx. ED_CONV3D_VEC=0 restores the original.
+            static const int vec_off = (getenv("ED_CONV3D_VEC") && getenv("ED_CONV3D_VEC")[0] == '0') ? 0 : 1;
+            if (vec_off) {
+                for (int64_t ic = 0; ic < c; ++ic) {
+                    const int64_t cn_idx = batch_idx * c + ic;
+                    const char * src_c_base = (const char *)src_data + cn_idx * src->nb[3];
+                    char * dst_c_base = dst_row + ic * knl_n_per_channel * traits->type_size;
+                    for (int64_t kz = 0; kz < knl_d; ++kz) {
+                        const int64_t sz = dst_z * s2 + kz * d2 - p2;
+                        const bool z_in = (sz >= 0 && sz < src_d);
+                        for (int64_t ky = 0; ky < knl_h; ++ky) {
+                            const int64_t sy = dst_y * s1 + ky * d1 - p1;
+                            char * dst_ky = dst_c_base + (kz * (knl_h * knl_w) + ky * knl_w) * traits->type_size;
+                            if (!z_in || sy < 0 || sy >= src_h) {
+                                // whole kx row is zero-padding
+                                for (int64_t kx = 0; kx < knl_w; ++kx) {
+                                    char * ep = dst_ky + kx * traits->type_size;
+                                    if (kernel_type == GGML_TYPE_F32)      *(float *)ep = 0.0f;
+                                    else if (kernel_type == GGML_TYPE_F16) *(ggml_fp16_t *)ep = GGML_CPU_FP32_TO_FP16(0.0f);
+                                    else                                    *(ggml_bf16_t *)ep = GGML_FP32_TO_BF16(0.0f);
+                                }
+                                continue;
+                            }
+                            const char * src_zy = src_c_base + sz * src->nb[2] + sy * src->nb[1];
+                            for (int64_t kx = 0; kx < knl_w; ++kx) {
+                                const int64_t sx = dst_x * s0 + kx * d0 - p0;
+                                float src_val;
+                                if (sx < 0 || sx >= src_w) {
+                                    src_val = 0.0f;
+                                } else {
+                                    src_val = *(const float *)(src_zy + sx * src->nb[0]);
+                                }
+                                char * ep = dst_ky + kx * traits->type_size;
+                                if (kernel_type == GGML_TYPE_F32)      *(float *)ep = src_val;
+                                else if (kernel_type == GGML_TYPE_F16) *(ggml_fp16_t *)ep = GGML_CPU_FP32_TO_FP16(src_val);
+                                else                                    *(ggml_bf16_t *)ep = GGML_FP32_TO_BF16(src_val);
+                            }
+                        }
+                    }
+                }
+            } else
             for (int64_t ic = 0; ic < c; ++ic) {
                 for (int64_t kz = 0; kz < knl_d; ++kz) {
                     for (int64_t ky = 0; ky < knl_h; ++ky) {

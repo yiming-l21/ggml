@@ -6917,6 +6917,51 @@ void ggml_compute_forward_conv_2d(
 
 // ggml_compute_forward_conv_3d
 
+// edge-dit: bulk fp32 -> kernel_type packers for the conv3d im2col fill.
+// The im2col row is knl_n_total contiguous elements in [ic][kz][ky][kx] order, so
+// we gather source values into an fp32 scratch (cheap, branchy bound checks only)
+// and then convert the whole run 16 lanes/step. The original code converted every
+// element individually inside a length-knl_w (=3) inner loop, which the compiler
+// cannot vectorize; the im2col fill was ~71% of conv3d time in Wan VAE decode.
+//
+// Numerics match the scalar reference bit-for-bit for all non-NaN inputs:
+//  - bf16 uses the same round-to-nearest-even integer formula as
+//    ggml_compute_fp32_to_bf16 / GGML_FP32_TO_BF16 (no subnormal flush).
+//  - f16 uses _mm512_cvtps_ph(v, 0), the vector form of the scalar F16C
+//    _cvtss_sh(x, 0) used by GGML_CPU_FP32_TO_FP16.
+// ggml.c's ggml_fp32_to_bf16_row is *not* built with -march=native here, so it
+// falls back to scalar; hence the SIMD is written inline in this (native) TU.
+static inline void ggml_conv3d_pack_bf16(const float * GGML_RESTRICT src,
+                                         ggml_bf16_t * GGML_RESTRICT dst, int64_t n) {
+    int64_t i = 0;
+#if defined(__AVX512F__)
+    const __m512i c7fff = _mm512_set1_epi32(0x7fff);
+    const __m512i c1    = _mm512_set1_epi32(1);
+    for (; i + 16 <= n; i += 16) {
+        const __m512i u = _mm512_castps_si512(_mm512_loadu_ps(src + i));
+        const __m512i r = _mm512_add_epi32(_mm512_add_epi32(u, c7fff),
+                                           _mm512_and_epi32(_mm512_srli_epi32(u, 16), c1));
+        _mm256_storeu_si256((__m256i *)(dst + i), _mm512_cvtepi32_epi16(_mm512_srli_epi32(r, 16)));
+    }
+#endif
+    for (; i < n; ++i) {
+        dst[i] = GGML_FP32_TO_BF16(src[i]);
+    }
+}
+
+static inline void ggml_conv3d_pack_fp16(const float * GGML_RESTRICT src,
+                                         ggml_fp16_t * GGML_RESTRICT dst, int64_t n) {
+    int64_t i = 0;
+#if defined(__AVX512F__)
+    for (; i + 16 <= n; i += 16) {
+        _mm256_storeu_si256((__m256i *)(dst + i), _mm512_cvtps_ph(_mm512_loadu_ps(src + i), 0));
+    }
+#endif
+    for (; i < n; ++i) {
+        dst[i] = GGML_CPU_FP32_TO_FP16(src[i]);
+    }
+}
+
 static void ggml_compute_forward_conv_3d_impl(const ggml_compute_params * params,
                                               const ggml_tensor *         kernel,
                                               const ggml_tensor *         src,
@@ -6988,52 +7033,67 @@ static void ggml_compute_forward_conv_3d_impl(const ggml_compute_params * params
 
             char * dst_row = (char *) tmp + (p % patches_per_batch) * knl_n_total * traits->type_size;
 
-            // edge-dit: hoist loop-invariant bound checks and base-pointer math out of
-            // the innermost loop. sz/sy depend only on kz/ky; the src channel base and
-            // the z/y plane offset are constant across kx. The original body recomputed
-            // all of that (and the out-of-bounds test) per element — the im2col fill was
-            // ~71% of conv3d time (2.3s of 3.3s in Wan VAE decode). Only the sx bound and
-            // the fp32->kernel_type convert stay in the hot inner loop, which the compiler
-            // can then vectorize over contiguous kx. ED_CONV3D_VEC=0 restores the original.
-            static const int vec_off = (getenv("ED_CONV3D_VEC") && getenv("ED_CONV3D_VEC")[0] == '0') ? 0 : 1;
-            if (vec_off) {
+            // edge-dit: vectorized im2col fill. A patch's im2col row is knl_n_total
+            // contiguous elements in [ic][kz][ky][kx] order. We gather the source
+            // values into a per-thread fp32 scratch (branchy bound checks only, no
+            // conversion), then convert the whole run to the kernel type 16 lanes at a
+            // time. The original code converted every element inside a length-knl_w
+            // (=3) inner loop, which the compiler cannot vectorize; this im2col fill was
+            // ~71% of conv3d time (2.3s of 3.3s in Wan VAE decode). Interior kx runs are
+            // contiguous in W (nb[0]=f32), so they memcpy in one shot; only patches
+            // touching the padding fall back to the per-element bound check. For fp32
+            // kernels we gather straight into dst_row (no conversion needed).
+            // ED_CONV3D_VEC=0 restores the original scalar implementation.
+            static const int conv3d_vec = (getenv("ED_CONV3D_VEC") && getenv("ED_CONV3D_VEC")[0] == '0') ? 0 : 1;
+            if (conv3d_vec) {
+                float * f32dst;
+                if (kernel_type == GGML_TYPE_F32) {
+                    f32dst = (float *) dst_row;              // gather in place, no convert
+                } else {
+                    static thread_local std::vector<float> f32buf;
+                    if ((int64_t) f32buf.size() < knl_n_total) {
+                        f32buf.resize(knl_n_total);
+                    }
+                    f32dst = f32buf.data();
+                }
+
+                const bool w_contig = (src->nb[0] == sizeof(float));
                 for (int64_t ic = 0; ic < c; ++ic) {
                     const int64_t cn_idx = batch_idx * c + ic;
-                    const char * src_c_base = (const char *)src_data + cn_idx * src->nb[3];
-                    char * dst_c_base = dst_row + ic * knl_n_per_channel * traits->type_size;
+                    const char * src_c_base = (const char *) src_data + cn_idx * src->nb[3];
+                    float * dst_c_base = f32dst + ic * knl_n_per_channel;
                     for (int64_t kz = 0; kz < knl_d; ++kz) {
                         const int64_t sz = dst_z * s2 + kz * d2 - p2;
                         const bool z_in = (sz >= 0 && sz < src_d);
                         for (int64_t ky = 0; ky < knl_h; ++ky) {
                             const int64_t sy = dst_y * s1 + ky * d1 - p1;
-                            char * dst_ky = dst_c_base + (kz * (knl_h * knl_w) + ky * knl_w) * traits->type_size;
+                            float * out = dst_c_base + kz * (knl_h * knl_w) + ky * knl_w;
                             if (!z_in || sy < 0 || sy >= src_h) {
-                                // whole kx row is zero-padding
-                                for (int64_t kx = 0; kx < knl_w; ++kx) {
-                                    char * ep = dst_ky + kx * traits->type_size;
-                                    if (kernel_type == GGML_TYPE_F32)      *(float *)ep = 0.0f;
-                                    else if (kernel_type == GGML_TYPE_F16) *(ggml_fp16_t *)ep = GGML_CPU_FP32_TO_FP16(0.0f);
-                                    else                                    *(ggml_bf16_t *)ep = GGML_FP32_TO_BF16(0.0f);
-                                }
+                                for (int64_t kx = 0; kx < knl_w; ++kx) out[kx] = 0.0f;
                                 continue;
                             }
                             const char * src_zy = src_c_base + sz * src->nb[2] + sy * src->nb[1];
-                            for (int64_t kx = 0; kx < knl_w; ++kx) {
-                                const int64_t sx = dst_x * s0 + kx * d0 - p0;
-                                float src_val;
-                                if (sx < 0 || sx >= src_w) {
-                                    src_val = 0.0f;
-                                } else {
-                                    src_val = *(const float *)(src_zy + sx * src->nb[0]);
+                            const int64_t x0 = dst_x * s0 - p0;   // sx = x0 + kx*d0
+                            if (d0 == 1 && w_contig && x0 >= 0 && x0 + knl_w <= src_w) {
+                                // whole kx run in bounds and contiguous along W
+                                memcpy(out, src_zy + x0 * src->nb[0], (size_t) knl_w * sizeof(float));
+                            } else {
+                                for (int64_t kx = 0; kx < knl_w; ++kx) {
+                                    const int64_t sx = x0 + kx * d0;
+                                    out[kx] = (sx < 0 || sx >= src_w) ? 0.0f
+                                              : *(const float *)(src_zy + sx * src->nb[0]);
                                 }
-                                char * ep = dst_ky + kx * traits->type_size;
-                                if (kernel_type == GGML_TYPE_F32)      *(float *)ep = src_val;
-                                else if (kernel_type == GGML_TYPE_F16) *(ggml_fp16_t *)ep = GGML_CPU_FP32_TO_FP16(src_val);
-                                else                                    *(ggml_bf16_t *)ep = GGML_FP32_TO_BF16(src_val);
                             }
                         }
                     }
                 }
+
+                if (kernel_type == GGML_TYPE_BF16) {
+                    ggml_conv3d_pack_bf16(f32dst, (ggml_bf16_t *) dst_row, knl_n_total);
+                } else if (kernel_type == GGML_TYPE_F16) {
+                    ggml_conv3d_pack_fp16(f32dst, (ggml_fp16_t *) dst_row, knl_n_total);
+                }
+                // GGML_TYPE_F32: gathered in place above.
             } else
             for (int64_t ic = 0; ic < c; ++ic) {
                 for (int64_t kz = 0; kz < knl_d; ++kz) {

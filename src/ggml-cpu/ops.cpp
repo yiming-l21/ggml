@@ -7001,6 +7001,28 @@ static void ggml_compute_forward_conv_3d_impl(const ggml_compute_params * params
     void  * knl_data       = kernel->data;
     float * dst_data       = (float *) dst->data;
 
+#if GGML_USE_ONEDNN
+    // bf16 kernel: route CONV_3D through oneDNN's native AMX conv primitive
+    // (~17% faster VAE decode). Falls back to the im2col+GEMM path below when
+    // the primitive is unavailable. Set ED_ONEDNN_CONV3D_OFF=1 to force fallback.
+    if (kernel_type == GGML_TYPE_BF16 && !getenv("ED_ONEDNN_CONV3D_OFF") &&
+        ggml_is_contiguous(src) && ggml_is_contiguous(dst)) {
+        if (params->ith == 0) {
+            const bool ok = ed_onednn_conv3d_bf16(
+                     n, c, src_d, src_h, src_w,
+                     oc, knl_d, knl_h, knl_w,
+                     dst_d, dst_h, dst_w,
+                     s2, s1, s0, p2, p1, p0, d2 - 1, d1 - 1, d0 - 1,
+                     src_data, knl_data, dst_data);
+            ggml_threadpool_chunk_set(params->threadpool, ok ? -1 : 0);
+        }
+        ggml_barrier(params->threadpool);
+        if (ggml_threadpool_chunk_add(params->threadpool, 0) == -1) {
+            return;
+        }
+    }
+#endif
+
     const int64_t knl_n_per_channel = knl_w * knl_h * knl_d;
     const int64_t knl_n_total       = knl_n_per_channel * c;
     const int64_t patch_total       = n * dst_w * dst_h * dst_d;

@@ -30,6 +30,20 @@ bool ed_onednn_conv2d_bf16(int64_t N, int64_t IC, int64_t IH, int64_t IW,
                            const void* wgt_bf16,
                            void* dst_f32);
 
+// bf16 3D convolution via oneDNN's native AMX conv primitive. Layout contract is
+// the 5D extension of ed_onednn_conv2d_bf16: src/dst are plain NCDHW f32, weights
+// are plain OIDHW bf16. Returns false on failure so callers can fall back to the
+// existing ggml im2col+GEMM implementation.
+bool ed_onednn_conv3d_bf16(int64_t N, int64_t IC, int64_t ID, int64_t IH, int64_t IW,
+                           int64_t OC, int64_t KD, int64_t KH, int64_t KW,
+                           int64_t OD, int64_t OH, int64_t OW,
+                           int64_t sd, int64_t sh, int64_t sw,
+                           int64_t pd, int64_t ph, int64_t pw,
+                           int64_t dd, int64_t dh, int64_t dw,
+                           const void* src_f32,
+                           const void* wgt_bf16,
+                           void* dst_f32);
+
 // Fused flash attention via oneDNN brgemm ukernel (AMX bf16), tiled with online
 // softmax so the [n_q, n_kv] score matrix is never materialized. Mirrors ATen's
 // cpu_flash_attention. Called per graph node; parallelizes internally over

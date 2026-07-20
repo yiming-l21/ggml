@@ -8,6 +8,10 @@
 #include "unary-ops.h"
 #include "vec.h"
 
+#if GGML_USE_ONEDNN
+#include "ggml-onednn.h"
+#endif
+
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -2043,6 +2047,59 @@ static void ggml_compute_forward_concat_f32(
 
     int64_t o[4] = {0, 0, 0, 0};
     o[dim] = src0->ne[dim];
+
+    // Fast path: when concatenating along dim>=1 and the inner dim0 rows of src and
+    // dst are contiguous f32, each (i1,i2,i3) row is a whole contiguous span we can
+    // memcpy, and we parallelize over the FULL flattened (i3,i2,i1) space instead of
+    // only i2. The generic path below strides one float at a time over i2%nth cores
+    // — for the Flux QKV concat that is 24 heads on a 96-core box (75% idle) plus
+    // per-element address math. This makes it embarrassingly parallel + bandwidth-bound.
+    if (dim >= 1 &&
+        nb00 == sizeof(float) && nb0 == sizeof(float) &&
+        nb10 == sizeof(float)) {
+        const int64_t rows = ne1 * ne2 * ne3;
+        for (int64_t r = ith; r < rows; r += nth) {
+            const int64_t i1 = r % ne1;
+            const int64_t i2 = (r / ne1) % ne2;
+            const int64_t i3 = r / (ne1 * ne2);
+
+            float * dst_row = (float *)((char *)dst->data + i1*nb1 + i2*nb2 + i3*nb3);
+            if (i1 < ne01 && i2 < ne02 && i3 < ne03) {
+                const float * src_row = (const float *)((const char *)src0->data + i1*nb01 + i2*nb02 + i3*nb03);
+                memcpy(dst_row, src_row, ne00 * sizeof(float));
+                // If dst is wider than src0 along dim0 (only when dim==0, excluded here),
+                // the tail would come from src1; dim>=1 guarantees ne0==ne00==ne10.
+            } else {
+                const float * src_row = (const float *)((const char *)src1->data +
+                    (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13);
+                memcpy(dst_row, src_row, ne10 * sizeof(float));
+            }
+        }
+        return;
+    }
+
+    // Fast path for dim==0 (concatenate along the contiguous inner axis): each
+    // (i1,i2,i3) dst row = src0's ne00 floats followed by src1's ne10 floats, both
+    // contiguous, so two memcpys per row. Parallelize over the full row space. This
+    // is the Flux single-block attn||mlp concat (dim0 3072+12288, 38 blocks) — big
+    // and previously single-i2-strided + scalar.
+    if (dim == 0 &&
+        nb00 == sizeof(float) && nb01 == (size_t)ne00 * sizeof(float) &&
+        nb10 == sizeof(float) && nb11 == (size_t)ne10 * sizeof(float) &&
+        nb0  == sizeof(float)) {
+        const int64_t rows = ne1 * ne2 * ne3;
+        for (int64_t r = ith; r < rows; r += nth) {
+            const int64_t i1 = r % ne1;
+            const int64_t i2 = (r / ne1) % ne2;
+            const int64_t i3 = r / (ne1 * ne2);
+            char * dst_row = (char *)dst->data + i1*nb1 + i2*nb2 + i3*nb3;
+            const float * s0 = (const float *)((const char *)src0->data + i1*nb01 + i2*nb02 + i3*nb03);
+            const float * s1 = (const float *)((const char *)src1->data + i1*nb11 + i2*nb12 + i3*nb13);
+            memcpy(dst_row,                         s0, ne00 * sizeof(float));
+            memcpy(dst_row + ne00 * sizeof(float),  s1, ne10 * sizeof(float));
+        }
+        return;
+    }
 
     const float * x;
 
@@ -6706,7 +6763,7 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
                                               ggml_type                   kernel_type) {
 
     GGML_ASSERT(ggml_is_contiguous(kernel));
-    GGML_ASSERT(kernel_type == GGML_TYPE_F16 || kernel_type == GGML_TYPE_F32);
+    GGML_ASSERT(kernel_type == GGML_TYPE_F16 || kernel_type == GGML_TYPE_F32 || kernel_type == GGML_TYPE_BF16);
     GGML_ASSERT(kernel->type == kernel_type);
 
     const ggml_type_traits * traits = ggml_get_type_traits(kernel_type);
@@ -6732,6 +6789,28 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
     const float * src_data = (float *) src->data;
     void  * knl_data       = kernel->data;
     float * dst_data       = (float *) dst->data;
+
+#if GGML_USE_ONEDNN
+    // Route bf16 conv through oneDNN's native AMX conv (fuses im2col into the
+    // kernel — no giant im2col buffer). ith==0 enters; oneDNN parallelizes
+    // internally. Falls back to the im2col+GEMM path below on any failure.
+    if (kernel_type == GGML_TYPE_BF16 && !getenv("ED_ONEDNN_CONV_OFF") &&
+        ggml_is_contiguous(src) && ggml_is_contiguous(dst)) {
+        if (params->ith == 0) {
+            const bool ok = ed_onednn_conv2d_bf16(
+                     src->ne[3], c_in, src_h, src_w,
+                     c_out, knl_h, knl_w, dst_h, dst_w,
+                     stride_y, stride_x, pad_y, pad_x, dilation_y - 1, dilation_x - 1,
+                     src_data, knl_data, dst_data);
+            ggml_threadpool_chunk_set(params->threadpool, ok ? -1 : 0);
+        }
+        ggml_barrier(params->threadpool);
+        if (ggml_threadpool_chunk_add(params->threadpool, 0) == -1) {
+            return;  // oneDNN handled it
+        }
+        // oneDNN declined/failed: fall through to the ggml im2col+GEMM path.
+    }
+#endif
 
     const int64_t knl_n           = knl_w * knl_h * c_in;
     const int64_t patch_total     = dst->ne[3] * dst_w * dst_h;
@@ -6786,6 +6865,8 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
                             *(float *) element_ptr = src_val;
                         } else if (kernel_type == GGML_TYPE_F16) {
                             *(ggml_fp16_t *) element_ptr = GGML_CPU_FP32_TO_FP16(src_val);
+                        } else if (kernel_type == GGML_TYPE_BF16) {
+                            *(ggml_bf16_t *) element_ptr = GGML_FP32_TO_BF16(src_val);
                         }
                     }
                 }
@@ -6836,6 +6917,51 @@ void ggml_compute_forward_conv_2d(
 
 // ggml_compute_forward_conv_3d
 
+// edge-dit: bulk fp32 -> kernel_type packers for the conv3d im2col fill.
+// The im2col row is knl_n_total contiguous elements in [ic][kz][ky][kx] order, so
+// we gather source values into an fp32 scratch (cheap, branchy bound checks only)
+// and then convert the whole run 16 lanes/step. The original code converted every
+// element individually inside a length-knl_w (=3) inner loop, which the compiler
+// cannot vectorize; the im2col fill was ~71% of conv3d time in Wan VAE decode.
+//
+// Numerics match the scalar reference bit-for-bit for all non-NaN inputs:
+//  - bf16 uses the same round-to-nearest-even integer formula as
+//    ggml_compute_fp32_to_bf16 / GGML_FP32_TO_BF16 (no subnormal flush).
+//  - f16 uses _mm512_cvtps_ph(v, 0), the vector form of the scalar F16C
+//    _cvtss_sh(x, 0) used by GGML_CPU_FP32_TO_FP16.
+// ggml.c's ggml_fp32_to_bf16_row is *not* built with -march=native here, so it
+// falls back to scalar; hence the SIMD is written inline in this (native) TU.
+static inline void ggml_conv3d_pack_bf16(const float * GGML_RESTRICT src,
+                                         ggml_bf16_t * GGML_RESTRICT dst, int64_t n) {
+    int64_t i = 0;
+#if defined(__AVX512F__)
+    const __m512i c7fff = _mm512_set1_epi32(0x7fff);
+    const __m512i c1    = _mm512_set1_epi32(1);
+    for (; i + 16 <= n; i += 16) {
+        const __m512i u = _mm512_castps_si512(_mm512_loadu_ps(src + i));
+        const __m512i r = _mm512_add_epi32(_mm512_add_epi32(u, c7fff),
+                                           _mm512_and_epi32(_mm512_srli_epi32(u, 16), c1));
+        _mm256_storeu_si256((__m256i *)(dst + i), _mm512_cvtepi32_epi16(_mm512_srli_epi32(r, 16)));
+    }
+#endif
+    for (; i < n; ++i) {
+        dst[i] = GGML_FP32_TO_BF16(src[i]);
+    }
+}
+
+static inline void ggml_conv3d_pack_fp16(const float * GGML_RESTRICT src,
+                                         ggml_fp16_t * GGML_RESTRICT dst, int64_t n) {
+    int64_t i = 0;
+#if defined(__AVX512F__)
+    for (; i + 16 <= n; i += 16) {
+        _mm256_storeu_si256((__m256i *)(dst + i), _mm512_cvtps_ph(_mm512_loadu_ps(src + i), 0));
+    }
+#endif
+    for (; i < n; ++i) {
+        dst[i] = GGML_CPU_FP32_TO_FP16(src[i]);
+    }
+}
+
 static void ggml_compute_forward_conv_3d_impl(const ggml_compute_params * params,
                                               const ggml_tensor *         kernel,
                                               const ggml_tensor *         src,
@@ -6843,7 +6969,7 @@ static void ggml_compute_forward_conv_3d_impl(const ggml_compute_params * params
                                               ggml_type                   kernel_type) {
 
     GGML_ASSERT(ggml_is_contiguous(kernel));
-    GGML_ASSERT(kernel_type == GGML_TYPE_F16 || kernel_type == GGML_TYPE_F32);
+    GGML_ASSERT(kernel_type == GGML_TYPE_F16 || kernel_type == GGML_TYPE_F32 || kernel_type == GGML_TYPE_BF16);
     GGML_ASSERT(kernel->type == kernel_type);
 
     const ggml_type_traits * traits = ggml_get_type_traits(kernel_type);
@@ -6874,6 +7000,28 @@ static void ggml_compute_forward_conv_3d_impl(const ggml_compute_params * params
     const float * src_data = (float *) src->data;
     void  * knl_data       = kernel->data;
     float * dst_data       = (float *) dst->data;
+
+#if GGML_USE_ONEDNN
+    // bf16 kernel: route CONV_3D through oneDNN's native AMX conv primitive
+    // (~17% faster VAE decode). Falls back to the im2col+GEMM path below when
+    // the primitive is unavailable. Set ED_ONEDNN_CONV3D_OFF=1 to force fallback.
+    if (kernel_type == GGML_TYPE_BF16 && !getenv("ED_ONEDNN_CONV3D_OFF") &&
+        ggml_is_contiguous(src) && ggml_is_contiguous(dst)) {
+        if (params->ith == 0) {
+            const bool ok = ed_onednn_conv3d_bf16(
+                     n, c, src_d, src_h, src_w,
+                     oc, knl_d, knl_h, knl_w,
+                     dst_d, dst_h, dst_w,
+                     s2, s1, s0, p2, p1, p0, d2 - 1, d1 - 1, d0 - 1,
+                     src_data, knl_data, dst_data);
+            ggml_threadpool_chunk_set(params->threadpool, ok ? -1 : 0);
+        }
+        ggml_barrier(params->threadpool);
+        if (ggml_threadpool_chunk_add(params->threadpool, 0) == -1) {
+            return;
+        }
+    }
+#endif
 
     const int64_t knl_n_per_channel = knl_w * knl_h * knl_d;
     const int64_t knl_n_total       = knl_n_per_channel * c;
@@ -6907,6 +7055,68 @@ static void ggml_compute_forward_conv_3d_impl(const ggml_compute_params * params
 
             char * dst_row = (char *) tmp + (p % patches_per_batch) * knl_n_total * traits->type_size;
 
+            // edge-dit: vectorized im2col fill. A patch's im2col row is knl_n_total
+            // contiguous elements in [ic][kz][ky][kx] order. We gather the source
+            // values into a per-thread fp32 scratch (branchy bound checks only, no
+            // conversion), then convert the whole run to the kernel type 16 lanes at a
+            // time. The original code converted every element inside a length-knl_w
+            // (=3) inner loop, which the compiler cannot vectorize; this im2col fill was
+            // ~71% of conv3d time (2.3s of 3.3s in Wan VAE decode). Interior kx runs are
+            // contiguous in W (nb[0]=f32), so they memcpy in one shot; only patches
+            // touching the padding fall back to the per-element bound check. For fp32
+            // kernels we gather straight into dst_row (no conversion needed).
+            // ED_CONV3D_VEC=0 restores the original scalar implementation.
+            static const int conv3d_vec = (getenv("ED_CONV3D_VEC") && getenv("ED_CONV3D_VEC")[0] == '0') ? 0 : 1;
+            if (conv3d_vec) {
+                float * f32dst;
+                if (kernel_type == GGML_TYPE_F32) {
+                    f32dst = (float *) dst_row;              // gather in place, no convert
+                } else {
+                    static thread_local std::vector<float> f32buf;
+                    if ((int64_t) f32buf.size() < knl_n_total) {
+                        f32buf.resize(knl_n_total);
+                    }
+                    f32dst = f32buf.data();
+                }
+
+                const bool w_contig = (src->nb[0] == sizeof(float));
+                for (int64_t ic = 0; ic < c; ++ic) {
+                    const int64_t cn_idx = batch_idx * c + ic;
+                    const char * src_c_base = (const char *) src_data + cn_idx * src->nb[3];
+                    float * dst_c_base = f32dst + ic * knl_n_per_channel;
+                    for (int64_t kz = 0; kz < knl_d; ++kz) {
+                        const int64_t sz = dst_z * s2 + kz * d2 - p2;
+                        const bool z_in = (sz >= 0 && sz < src_d);
+                        for (int64_t ky = 0; ky < knl_h; ++ky) {
+                            const int64_t sy = dst_y * s1 + ky * d1 - p1;
+                            float * out = dst_c_base + kz * (knl_h * knl_w) + ky * knl_w;
+                            if (!z_in || sy < 0 || sy >= src_h) {
+                                for (int64_t kx = 0; kx < knl_w; ++kx) out[kx] = 0.0f;
+                                continue;
+                            }
+                            const char * src_zy = src_c_base + sz * src->nb[2] + sy * src->nb[1];
+                            const int64_t x0 = dst_x * s0 - p0;   // sx = x0 + kx*d0
+                            if (d0 == 1 && w_contig && x0 >= 0 && x0 + knl_w <= src_w) {
+                                // whole kx run in bounds and contiguous along W
+                                memcpy(out, src_zy + x0 * src->nb[0], (size_t) knl_w * sizeof(float));
+                            } else {
+                                for (int64_t kx = 0; kx < knl_w; ++kx) {
+                                    const int64_t sx = x0 + kx * d0;
+                                    out[kx] = (sx < 0 || sx >= src_w) ? 0.0f
+                                              : *(const float *)(src_zy + sx * src->nb[0]);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (kernel_type == GGML_TYPE_BF16) {
+                    ggml_conv3d_pack_bf16(f32dst, (ggml_bf16_t *) dst_row, knl_n_total);
+                } else if (kernel_type == GGML_TYPE_F16) {
+                    ggml_conv3d_pack_fp16(f32dst, (ggml_fp16_t *) dst_row, knl_n_total);
+                }
+                // GGML_TYPE_F32: gathered in place above.
+            } else
             for (int64_t ic = 0; ic < c; ++ic) {
                 for (int64_t kz = 0; kz < knl_d; ++kz) {
                     for (int64_t ky = 0; ky < knl_h; ++ky) {
@@ -6931,6 +7141,8 @@ static void ggml_compute_forward_conv_3d_impl(const ggml_compute_params * params
                                 *(float *)element_ptr = src_val;
                             } else if (kernel_type == GGML_TYPE_F16) {
                                 *(ggml_fp16_t *)element_ptr = GGML_CPU_FP32_TO_FP16(src_val);
+                            } else if (kernel_type == GGML_TYPE_BF16) {
+                                *(ggml_bf16_t *)element_ptr = GGML_FP32_TO_BF16(src_val);
                             }
                         }
                     }
@@ -8943,6 +9155,49 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+#if GGML_USE_ONEDNN
+    // edge-dit: fused bf16 AMX flash attention (brgemm ukernel). Handles the common
+    // no-mask, no-softcap, f16/f32 case; falls back to ggml otherwise. Env kill-switch
+    // ED_ONEDNN_FLASH_OFF. dst layout is [DV, n_head, n_q, batch].
+    {
+        const ggml_tensor * q = dst->src[0];
+        const ggml_tensor * k = dst->src[1];
+        const ggml_tensor * v = dst->src[2];
+        const ggml_tensor * mask = dst->src[3];
+        float scale = 1.0f, max_bias = 0.0f, logit_softcap = 0.0f;
+        memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+        memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+        memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+        const bool typ_ok = (q->type==GGML_TYPE_F32||q->type==GGML_TYPE_F16) &&
+                            (k->type==GGML_TYPE_F32||k->type==GGML_TYPE_F16) &&
+                            (v->type==GGML_TYPE_F32||v->type==GGML_TYPE_F16);
+        if (typ_ok && mask==nullptr && max_bias==0.0f && logit_softcap==0.0f &&
+            q->ne[0]==v->ne[0] && dst->type==GGML_TYPE_F32 &&
+            !getenv("ED_ONEDNN_FLASH_OFF")) {
+            const int64_t d_head = q->ne[0];
+            const int64_t n_q = q->ne[1], n_head = q->ne[2], batch = q->ne[3];
+            const int64_t n_kv = k->ne[1], n_head_kv = k->ne[2];
+            const int esz_q = (q->type==GGML_TYPE_F32)?4:2;
+            const int esz_k = (k->type==GGML_TYPE_F32)?4:2;
+            const int esz_v = (v->type==GGML_TYPE_F32)?4:2;
+            if (params->ith==0 && getenv("ED_FLASH_DEBUG")) {
+                fprintf(stderr,"[edflash] d=%ld nq=%ld nkv=%ld nh=%ld nhkv=%ld b=%ld scale=%.4f qtype=%d ktype=%d vtype=%d\n",
+                    (long)d_head,(long)n_q,(long)n_kv,(long)n_head,(long)n_head_kv,(long)batch,scale,(int)q->type,(int)k->type,(int)v->type);
+                fprintf(stderr,"[edflash] q.nb=%zu,%zu,%zu,%zu k.nb=%zu,%zu,%zu,%zu v.nb=%zu,%zu,%zu,%zu dst.ne=%ld,%ld,%ld,%ld dst.nb=%zu,%zu,%zu,%zu\n",
+                    q->nb[0],q->nb[1],q->nb[2],q->nb[3], k->nb[0],k->nb[1],k->nb[2],k->nb[3], v->nb[0],v->nb[1],v->nb[2],v->nb[3],
+                    (long)dst->ne[0],(long)dst->ne[1],(long)dst->ne[2],(long)dst->ne[3], dst->nb[0],dst->nb[1],dst->nb[2],dst->nb[3]);
+            }
+            bool ok = ed_onednn_flash_attn_bf16(
+                params->ith, params->nth,
+                d_head, n_q, n_kv, n_head, n_head_kv, batch, scale,
+                q->data, q->type, q->nb[1]/esz_q, q->nb[2]/esz_q, q->nb[3]/esz_q,
+                k->data, k->type, k->nb[1]/esz_k, k->nb[2]/esz_k, k->nb[3]/esz_k,
+                v->data, v->type, v->nb[1]/esz_v, v->nb[2]/esz_v, v->nb[3]/esz_v,
+                dst->data, dst->nb[1]/4, dst->nb[2]/4, dst->nb[3]/4);
+            if (ok) { return; }
+        }
+    }
+#endif
     switch (dst->op_params[3]) {
         case GGML_PREC_DEFAULT:
         case GGML_PREC_F32:
